@@ -328,6 +328,7 @@ def create_app(config_name='default'):
             # Validate request
             validation_result = validator.validate_process_request(request)
             if not validation_result['valid']:
+                logger.warning(f"Invalid process request: {validation_result}")
                 return jsonify({'error': validation_result['error']}), 400
 
             # Extract request data (supports both multipart and JSON)

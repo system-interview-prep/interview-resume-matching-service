@@ -33,7 +33,7 @@ class RequestValidator:
         self.validation_rules = {
             'job_description': {
                 'min_length': 20,
-                'max_length': 10000,
+                'max_length': 100000,
                 'required_patterns': [],  # Optional regex patterns
                 'forbidden_patterns': [r'<script.*?>.*?</script>']  # Security patterns
             },

@@ -1,23 +1,23 @@
 FROM python:3.10
 
-# Cài đặt các thư viện hệ thống cần thiết
-RUN apt-get update && apt-get install -y build-essential
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_ENV=production
+ENV DEBUG=False
+ENV PORT=5001
 
-# Tạo thư mục làm việc
 WORKDIR /app
 
-# Copy toàn bộ mã nguồn vào container
-COPY . /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+  && rm -rf /var/lib/apt/lists/*
 
-# Cài đặt các thư viện Python
-RUN pip install --upgrade pip
+COPY requirements.txt ./
+RUN pip install --upgrade pip setuptools wheel
 RUN pip install -r requirements.txt
 
-# Copy file .env nếu cần
-# COPY .env /app/.env
+COPY . .
 
-# Mở port nếu chạy Flask
 EXPOSE 5001
 
-# Lệnh chạy ứng dụng
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--timeout", "300", "app:create_app('production')"]

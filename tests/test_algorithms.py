@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from algorithms.similarity.cosine_similarity import CosineSimilarityAnalyzer
 from algorithms.similarity.jaccard_similarity import JaccardSimilarityAnalyzer
+from algorithms.similarity.requirements_analyzer import RequirementsAnalyzer
 from algorithms.similarity.must_have_analyzer import MustHaveAnalyzer
 from algorithms.similarity.ner_analyzer import NERAnalyzer
 
@@ -122,6 +123,50 @@ class TestAlgorithms(unittest.TestCase):
         self.assertTrue(result['details']['must_have_ok'])
         self.assertEqual(result['details']['missing_must_count'], 0)
         self.assertEqual(result['score'], 1.0)
+
+    def test_requirements_analyzer_scores_nice_to_have_and_constraints(self):
+        """Test structured requirements scoring covers all requirement groups"""
+        analyzer = RequirementsAnalyzer()
+        resume = "Backend engineer with Python, Docker, PostgreSQL, AWS, and English."
+        job = """
+        MUST HAVE
+        - Python
+        - Docker
+
+        NICE TO HAVE
+        - AWS
+        - Kubernetes
+
+        CONSTRAINTS
+        - English
+        """
+
+        result = analyzer.process_single(resume, job)
+
+        self.assertEqual(result['algorithm'], 'requirements')
+        self.assertTrue(result['details']['must_have_ok'])
+        self.assertTrue(result['details']['constraints_ok'])
+        self.assertIn('aws', result['details']['matched_nice_to_have'])
+        self.assertIn('kubernetes', result['details']['missing_nice_to_have'])
+        self.assertGreater(result['score'], 0.7)
+
+    def test_requirements_analyzer_reports_constraint_gap(self):
+        """Test constraints are reported separately from must-have"""
+        analyzer = RequirementsAnalyzer()
+        resume = "Frontend developer with React and TypeScript."
+        job = """
+        MUST HAVE
+        - React
+
+        CONSTRAINTS
+        - English
+        """
+
+        result = analyzer.process_single(resume, job)
+
+        self.assertTrue(result['details']['must_have_ok'])
+        self.assertFalse(result['details']['constraints_ok'])
+        self.assertIn('english', result['details']['missing_constraints'])
     
     def test_algorithm_consistency(self):
         """Test that algorithms return consistent results"""

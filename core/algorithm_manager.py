@@ -32,6 +32,7 @@ except ImportError:
     BM25Analyzer = None
 
 from algorithms.similarity.ner_analyzer import NERAnalyzer
+from algorithms.similarity.requirements_analyzer import RequirementsAnalyzer
 from algorithms.similarity.must_have_analyzer import MustHaveAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class AlgorithmManager:
             registry['jaccard'] = CosineSimilarityAnalyzer  # Warn at init time
 
         # Entity extraction
+        registry['requirements'] = RequirementsAnalyzer
         registry['must_have'] = MustHaveAnalyzer
         registry['ner'] = NERAnalyzer
 
@@ -126,6 +128,11 @@ class AlgorithmManager:
 
                     elif name == 'must_have':
                         algorithm_config.setdefault('strict', True)
+
+                    elif name == 'requirements':
+                        algorithm_config.setdefault('must_have_weight', 0.55)
+                        algorithm_config.setdefault('nice_to_have_weight', 0.25)
+                        algorithm_config.setdefault('constraints_weight', 0.20)
 
                     if name == 'jaccard' and self.algorithm_registry['jaccard'] is CosineSimilarityAnalyzer:
                         logger.warning("JaccardAnalyzer not found; falling back to Cosine. Add algorithms/similarity/jaccard_similarity.py for strict coverage scoring.")
@@ -206,7 +213,8 @@ class AlgorithmManager:
             'cosine': 0.20,
             'bm25': 0.10,
             'jaccard': 0.05,
-            'must_have': 0.15,
+            'requirements': 0.18,
+            'must_have': 0.12,
             'ner': 0.10,
         }
         cfg_weights = self.config.get('weights', {})
@@ -276,14 +284,57 @@ class AlgorithmManager:
                 resume_result['weighted_score'] = score_sum / total_weight
                 resume_result['combined_score'] = resume_result['weighted_score']
 
-            # Apply must-have penalty if any analyzer indicates failure.
+            # Apply a soft must-have penalty. Requirements scoring already captures
+            # missing must-haves, so a hard 0.5 multiplier double-penalizes long JDs.
+            max_missing_must = 0
             for alg_scores in resume_result['algorithm_scores'].values():
                 details = alg_scores.get('details', {})
                 must_ok = details.get('must_have_ok', True)
-                missing_must = details.get('missing_must_count', 0)
+                try:
+                    missing_must = int(details.get('missing_must_count', 0) or 0)
+                except Exception:
+                    missing_must = 0
+                max_missing_must = max(max_missing_must, missing_must)
                 if not must_ok or missing_must:
-                    resume_result['combined_score'] *= 0.5
+                    per_missing = float(self.config.get('must_have_penalty_per_missing', 0.04))
+                    floor = float(self.config.get('must_have_penalty_floor', 0.75))
+                    multiplier = max(floor, 1.0 - (missing_must * per_missing))
+                    resume_result['combined_score'] *= multiplier
+                    resume_result['details']['must_have_penalty'] = {
+                        'missing_must_count': missing_must,
+                        'multiplier': multiplier,
+                    }
                     break
+                if details.get('constraints_ok') is False:
+                    resume_result['combined_score'] *= 0.92
+                    resume_result['details']['constraints_penalty'] = {'multiplier': 0.92}
+
+            # Calibrate single-pair ATS-style scores: semantic relevance should be visible
+            # even when strict structured requirements are sparse or worded differently.
+            alg_scores = resume_result['algorithm_scores']
+            if 'sbert' in alg_scores:
+                sbert_score = float(alg_scores.get('sbert', {}).get('score', 0.0))
+                req_score = float(alg_scores.get('requirements', {}).get('score', 0.0))
+                bm25_score = float(alg_scores.get('bm25', {}).get('score', 0.0))
+                cosine_score = float(alg_scores.get('cosine', {}).get('score', 0.0))
+                lexical_score = max(bm25_score, cosine_score)
+                calibrated = (
+                    resume_result['weighted_score'] * 0.45
+                    + sbert_score * 0.35
+                    + req_score * 0.12
+                    + lexical_score * 0.08
+                )
+                if max_missing_must:
+                    calibrated *= max(0.90, 1.0 - (max_missing_must * 0.015))
+                if calibrated > resume_result['combined_score']:
+                    resume_result['details']['semantic_calibration'] = {
+                        'before': resume_result['combined_score'],
+                        'after': calibrated,
+                        'sbert': sbert_score,
+                        'requirements': req_score,
+                        'lexical': lexical_score,
+                    }
+                    resume_result['combined_score'] = calibrated
 
             combined_results.append(resume_result)
 

@@ -19,7 +19,7 @@ class RequestValidator:
         # Valid algorithms
         self.valid_algorithms = {
             'bert', 'distilbert', 'sbert',
-            'cosine', 'jaccard', 'bm25', 'must_have', 'ner',
+            'cosine', 'jaccard', 'bm25', 'requirements', 'must_have', 'ner',
         }
         
         # Valid positions
@@ -43,7 +43,7 @@ class RequestValidator:
                 'recommended_combinations': [
                     ['bert', 'cosine', 'ner'],
                     ['distilbert', 'bm25', 'ner'],
-                    ['must_have', 'sbert', 'bm25', 'cosine', 'ner'],
+                    ['requirements', 'sbert', 'bm25', 'cosine', 'ner'],
                 ]
             },
             'files': {

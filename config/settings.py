@@ -20,7 +20,7 @@ class Config:
     DEVICE = 'cuda' if os.getenv('USE_GPU', 'False').lower() == 'true' else 'cpu'
     
     # Algorithm Settings
-    DEFAULT_ALGORITHMS = ['must_have', 'sbert', 'bm25', 'cosine', 'ner']
+    DEFAULT_ALGORITHMS = ['requirements', 'sbert', 'bm25', 'cosine', 'ner']
     ALGORITHM_TIMEOUT = 300  # 5 minutes
     BATCH_SIZE = 32
 

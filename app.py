@@ -331,7 +331,7 @@ def create_app(config_name='default'):
                 return jsonify({'error': validation_result['error']}), 400
 
             # Extract request data (supports both multipart and JSON)
-            default_methods = list(app.config.get('DEFAULT_ALGORITHMS', ['must_have', 'sbert', 'bm25', 'cosine', 'ner']))
+            default_methods = list(app.config.get('DEFAULT_ALGORITHMS', ['requirements', 'sbert', 'bm25', 'cosine', 'ner']))
 
             files = []
             successful_files = []

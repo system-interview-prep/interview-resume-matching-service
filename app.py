@@ -11,6 +11,7 @@ import numpy as np
 
 from config.settings import config_dict
 from core.algorithm_manager import AlgorithmManager
+from core.vector_db import VectorDB
 from utils.file_processor import FileProcessor
 from utils.validators import RequestValidator
 from api.error_handlers import register_error_handlers
@@ -66,6 +67,19 @@ def create_app(config_name='default'):
     algorithm_manager = AlgorithmManager(app.config)
     file_processor = FileProcessor(app.config)
     validator = RequestValidator(app.config)
+    
+    # Initialize Vector Database (PostgreSQL + pgvector)
+    vector_db = None
+    try:
+        db_url = app.config.get('DATABASE_URL', '')
+        vec_dim = app.config.get('VECTOR_DIMENSION', 384)
+        if db_url:
+            vector_db = VectorDB(db_url, vec_dim)
+            vector_db.init_tables()
+            logger.info("Vector database initialized successfully")
+    except Exception as e:
+        logger.warning(f"Vector database not available: {e}. JD pre-computation endpoints will be disabled.")
+        vector_db = None
     
     # Create upload directory
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -245,6 +259,132 @@ def create_app(config_name='default'):
             parts.append("CONSTRAINTS\n" + "\n".join([f"- {x}" for x in constraints]))
         return "\n\n".join(parts)
     
+    # ===== VECTOR DB ENDPOINTS (Pre-computation) =====
+
+    @app.route('/api/v1/jd/vectorize', methods=['POST'])
+    def vectorize_jd():
+        """Pre-compute and store JD embedding in PostgreSQL pgvector.
+        
+        Body: { "job_id": "...", "job_text": "..." }
+        Called by NestJS backend when a new Job Profile is finalized.
+        """
+        if not vector_db:
+            return jsonify({'error': 'Vector database is not configured'}), 503
+
+        data = request.get_json(silent=True) or {}
+        job_id = str(data.get('job_id', '')).strip()
+        job_text = str(data.get('job_text', '')).strip()
+
+        # Also accept structured JD JSON
+        if not job_text and isinstance(data.get('job'), dict):
+            job_text = _job_json_to_text(data.get('job'))
+
+        if not job_id:
+            return jsonify({'error': 'job_id is required'}), 400
+        if not job_text:
+            return jsonify({'error': 'job_text (or job JSON) is required'}), 400
+
+        try:
+            # Ensure sBERT model is loaded
+            algorithm_manager.initialize_algorithms(['sbert'])
+            sbert_alg = algorithm_manager.algorithms.get('sbert')
+            if not sbert_alg or not hasattr(sbert_alg, 'model'):
+                return jsonify({'error': 'sBERT model is not available'}), 503
+
+            # Encode JD text into vector
+            embedding = sbert_alg.model.encode([job_text])[0]
+            vector_list = embedding.tolist()
+
+            # Store in PostgreSQL
+            vector_db.upsert_jd_vector(job_id, vector_list)
+
+            return jsonify({
+                'success': True,
+                'job_id': job_id,
+                'vector_dimension': len(vector_list),
+                'message': 'JD vectorized and stored successfully'
+            }), 200
+
+        except Exception as e:
+            logger.error(f"JD vectorize error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/jd/delete', methods=['POST'])
+    def delete_jd_vector():
+        """Delete a stored JD vector embedding.
+        
+        Body: { "job_id": "..." }
+        """
+        if not vector_db:
+            return jsonify({'error': 'Vector database is not configured'}), 503
+
+        data = request.get_json(silent=True) or {}
+        job_id = str(data.get('job_id', '')).strip()
+        if not job_id:
+            return jsonify({'error': 'job_id is required'}), 400
+
+        try:
+            vector_db.delete_jd_vector(job_id)
+            return jsonify({'success': True, 'job_id': job_id, 'message': 'JD vector deleted'}), 200
+        except Exception as e:
+            logger.error(f"JD delete error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/match', methods=['POST'])
+    def match_cv_jd():
+        """Match a CV against a pre-stored JD vector using sBERT cosine similarity.
+        
+        Body: { "job_id": "...", "cv_text": "..." } or { "job_id": "...", "cv": {...} }
+        Returns the sBERT similarity score computed via pgvector.
+        """
+        if not vector_db:
+            return jsonify({'error': 'Vector database is not configured'}), 503
+
+        data = request.get_json(silent=True) or {}
+        job_id = str(data.get('job_id', '')).strip()
+        cv_text = str(data.get('cv_text', '')).strip()
+
+        # Accept structured CV JSON
+        if not cv_text and isinstance(data.get('cv'), dict):
+            cv_text = _cv_json_to_text(data.get('cv'))
+
+        if not job_id:
+            return jsonify({'error': 'job_id is required'}), 400
+        if not cv_text:
+            return jsonify({'error': 'cv_text (or cv JSON) is required'}), 400
+
+        try:
+            # Ensure sBERT model is loaded
+            algorithm_manager.initialize_algorithms(['sbert'])
+            sbert_alg = algorithm_manager.algorithms.get('sbert')
+            if not sbert_alg or not hasattr(sbert_alg, 'model'):
+                return jsonify({'error': 'sBERT model is not available'}), 503
+
+            # Encode CV text into vector
+            cv_embedding = sbert_alg.model.encode([cv_text])[0]
+            cv_vector = cv_embedding.tolist()
+
+            # Compute similarity using pgvector (no need to re-encode JD!)
+            similarity = vector_db.cosine_similarity_score(job_id, cv_vector)
+
+            if similarity is None:
+                return jsonify({
+                    'error': f'JD vector not found for job_id={job_id}. Call /api/v1/jd/vectorize first.'
+                }), 404
+
+            return jsonify({
+                'success': True,
+                'job_id': job_id,
+                'sbert_score': round(float(max(0.0, min(1.0, similarity))), 4),
+                'message': 'CV-JD matching completed using cached JD vector'
+            }), 200
+
+        except Exception as e:
+            logger.error(f"CV-JD match error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
     # ===== EXISTING ENDPOINTS =====
     
     @app.route('/api/health', methods=['GET'])
@@ -262,62 +402,6 @@ def create_app(config_name='default'):
         """Get available algorithms"""
         return jsonify(algorithm_manager.get_algorithm_status())
     
-    @app.route('/api/positions', methods=['GET'])
-    def get_positions():
-        """Get available job positions"""
-        positions = [
-            {'value': 'sde', 'label': 'Software Development Engineer', 'icon': '💻'},
-            {'value': 'swe', 'label': 'Software Engineer', 'icon': '⚙️'},
-            {'value': 'ml_engineer', 'label': 'ML Engineer', 'icon': '🤖'},
-            {'value': 'data_scientist', 'label': 'Data Scientist', 'icon': '📊'},
-            {'value': 'devops', 'label': 'DevOps Engineer', 'icon': '🔧'},
-            {'value': 'frontend', 'label': 'Frontend Developer', 'icon': '🎨'},
-            {'value': 'backend', 'label': 'Backend Developer', 'icon': '🗄️'},
-            {'value': 'fullstack', 'label': 'Full Stack Developer', 'icon': '🚀'},
-            {'value': 'product_manager', 'label': 'Product Manager', 'icon': '📱'},
-            {'value': 'designer', 'label': 'UI/UX Designer', 'icon': '🎭'},
-            {'value': 'general', 'label': 'General', 'icon': '📋'}
-        ]
-        return jsonify(positions)
-    
-    @app.route('/api/supported-formats', methods=['GET'])
-    def get_supported_formats():
-        """Get supported file formats"""
-        return jsonify({
-            'formats': ['.pdf', '.docx', '.doc'],
-            'max_file_size': app.config['MAX_CONTENT_LENGTH'],
-            'max_files': app.config['MAX_FILES_PER_REQUEST'],
-            'supported_mime_types': [
-                'application/pdf',
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                'application/msword'
-            ]
-        })
-    
-    @app.route('/api/validate-files', methods=['POST'])
-    def validate_files():
-        """Validate uploaded files without processing"""
-        try:
-            files = request.files.getlist('files')
-            
-            if not files:
-                return jsonify({'error': 'No files provided'}), 400
-            
-            validation_results = []
-            for i, file in enumerate(files):
-                result = file_processor.validate_file(file)
-                result['index'] = i
-                validation_results.append(result)
-            
-            return jsonify({
-                'results': validation_results,
-                'total_files': len(files),
-                'valid_files': sum(1 for r in validation_results if r['valid'])
-            })
-            
-        except Exception as e:
-            logger.error(f"File validation error: {e}")
-            return jsonify({'error': 'File validation failed'}), 500
     
     @app.route('/api/process-resumes', methods=['POST'])
     def process_resumes():

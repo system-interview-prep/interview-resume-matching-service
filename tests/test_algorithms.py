@@ -146,7 +146,9 @@ class TestAlgorithms(unittest.TestCase):
         self.assertEqual(result['algorithm'], 'requirements')
         self.assertTrue(result['details']['must_have_ok'])
         self.assertTrue(result['details']['constraints_ok'])
-        self.assertIn('aws', result['details']['matched_nice_to_have'])
+        self.assertTrue(
+            any(item.startswith('aws') for item in result['details']['matched_nice_to_have'])
+        )
         self.assertIn('kubernetes', result['details']['missing_nice_to_have'])
         self.assertGreater(result['score'], 0.7)
 

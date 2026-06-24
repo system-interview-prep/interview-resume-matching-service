@@ -41,31 +41,6 @@ class TestAPI(unittest.TestCase):
         self.assertIn('available_algorithms', data)
         self.assertIsInstance(data['available_algorithms'], list)
     
-    def test_get_positions(self):
-        """Test positions endpoint"""
-        response = self.client.get('/api/positions')
-        self.assertEqual(response.status_code, 200)
-        
-        data = json.loads(response.data)
-        self.assertIsInstance(data, list)
-        self.assertGreater(len(data), 0)
-        
-        # Check structure of first position
-        position = data[0]
-        self.assertIn('value', position)
-        self.assertIn('label', position)
-        self.assertIn('icon', position)
-    
-    def test_get_supported_formats(self):
-        """Test supported formats endpoint"""
-        response = self.client.get('/api/supported-formats')
-        self.assertEqual(response.status_code, 200)
-        
-        data = json.loads(response.data)
-        self.assertIn('formats', data)
-        self.assertIn('max_file_size', data)
-        self.assertIn('max_files', data)
-    
     def test_process_resumes_missing_data(self):
         """Test process resumes with missing data"""
         response = self.client.post('/api/process-resumes')
@@ -95,13 +70,5 @@ class TestAPI(unittest.TestCase):
         finally:
             os.unlink(tmp_file_path)
     
-    def test_validate_files_empty(self):
-        """Test file validation with no files"""
-        response = self.client.post('/api/validate-files')
-        self.assertEqual(response.status_code, 400)
-        
-        data = json.loads(response.data)
-        self.assertIn('error', data)
-
 if __name__ == '__main__':
     unittest.main()

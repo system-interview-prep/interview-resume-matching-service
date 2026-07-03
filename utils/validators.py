@@ -106,18 +106,35 @@ class RequestValidator:
                 if not files_validation['valid']:
                     return files_validation
 
-            # Validate job description
+            # Extract job_id to determine if we can skip validation
+            job_id = None
             if request.is_json:
                 payload = request.get_json(silent=True) or {}
-                job_description = str(payload.get('jobDescription') or '').strip()
-                if not job_description and isinstance(payload.get('job'), dict):
-                    # API layer will build a jobDescription string from "job"
-                    job_description = "placeholder for validation"
+                metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                job_id = metadata.get('jobId') or metadata.get('job_id') or payload.get('job_id')
             else:
-                job_description = request.form.get('jobDescription', '').strip()
-            job_validation = self._validate_job_description(job_description)
-            if not job_validation['valid']:
-                return job_validation
+                metadata_str = request.form.get('metadata', '{}')
+                try:
+                    import json as _json
+                    metadata = _json.loads(metadata_str)
+                except Exception:
+                    metadata = {}
+                job_id = metadata.get('jobId') or metadata.get('job_id') or request.form.get('job_id')
+
+            # Validate job description (only if job_id is not provided)
+            job_description = ""
+            if not job_id:
+                if request.is_json:
+                    payload = request.get_json(silent=True) or {}
+                    job_description = str(payload.get('jobDescription') or '').strip()
+                    if not job_description and isinstance(payload.get('job'), dict):
+                        # API layer will build a jobDescription string from "job"
+                        job_description = "placeholder for validation"
+                else:
+                    job_description = request.form.get('jobDescription', '').strip()
+                job_validation = self._validate_job_description(job_description)
+                if not job_validation['valid']:
+                    return job_validation
             
             # Validate position
             if request.is_json:
@@ -156,14 +173,15 @@ class RequestValidator:
             if not options_validation['valid']:
                 return options_validation
             
-            # Cross-field validation
-            cross_validation = self._validate_cross_field_constraints(
-                files=(request.files.getlist('resumes') if not request.is_json else [object()] * (len(resumes) if 'resumes' in locals() else 1)),
-                methods=(methods or ['bert']),
-                job_description=job_description
-            )
-            if not cross_validation['valid']:
-                return cross_validation
+            # Cross-field validation (only if job_id is not provided)
+            if not job_id:
+                cross_validation = self._validate_cross_field_constraints(
+                    files=(request.files.getlist('resumes') if not request.is_json else [object()] * (len(resumes) if 'resumes' in locals() else 1)),
+                    methods=(methods or ['bert']),
+                    job_description=job_description
+                )
+                if not cross_validation['valid']:
+                    return cross_validation
             
             return {'valid': True, 'message': 'All validations passed'}
             
@@ -203,29 +221,42 @@ class RequestValidator:
         
         # Check required fields depending on input mode
         if is_multipart:
-            required_fields = ['jobDescription']  # methods can default in API layer
-            missing_fields = []
-            for field in required_fields:
-                if field not in request.form or not request.form.get(field):
-                    missing_fields.append(field)
-            if missing_fields:
-                return {
-                    'valid': False,
-                    'error': 'Missing required fields',
-                    'missing_fields': missing_fields,
-                    'required_fields': required_fields
-                }
+            metadata_str = request.form.get('metadata', '{}')
+            try:
+                import json as _json
+                metadata = _json.loads(metadata_str)
+            except Exception:
+                metadata = {}
+            job_id = metadata.get('jobId') or metadata.get('job_id') or request.form.get('job_id')
+
+            if not job_id:
+                required_fields = ['jobDescription']  # methods can default in API layer
+                missing_fields = []
+                for field in required_fields:
+                    if field not in request.form or not request.form.get(field):
+                        missing_fields.append(field)
+                if missing_fields:
+                    return {
+                        'valid': False,
+                        'error': 'Missing required fields',
+                        'missing_fields': missing_fields,
+                        'required_fields': required_fields
+                    }
         else:
             try:
                 payload = request.get_json(silent=True) or {}
             except Exception:
                 payload = {}
-            if not isinstance(payload, dict) or not (payload.get('jobDescription') or payload.get('job')):
+            
+            metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+            job_id = metadata.get('jobId') or metadata.get('job_id') or payload.get('job_id')
+
+            if not job_id and not (payload.get('jobDescription') or payload.get('job')):
                 return {
                     'valid': False,
                     'error': 'Missing required fields',
-                    'missing_fields': ['jobDescription'],
-                    'required_fields': ['jobDescription (string) or job (object)']
+                    'missing_fields': ['job_id / jobId', 'jobDescription'],
+                    'required_fields': ['jobDescription (string), job (object), or job_id in metadata/payload']
                 }
         
         return {'valid': True}

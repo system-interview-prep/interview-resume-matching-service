@@ -138,6 +138,8 @@ class AlgorithmManager:
                         logger.warning("JaccardAnalyzer not found; falling back to Cosine. Add algorithms/similarity/jaccard_similarity.py for strict coverage scoring.")
 
                     self.algorithms[name] = algorithm_class(algorithm_config)
+                    if hasattr(self, 'vector_db'):
+                        self.algorithms[name].vector_db = self.vector_db
                     if hasattr(self.algorithms[name], 'load_model'):
                         self.algorithms[name].load_model()
 
@@ -149,7 +151,7 @@ class AlgorithmManager:
 
     def process_resumes_parallel(self, resume_texts: List[str],
                                  job_description: str, algorithm_names: List[str],
-                                 position: str = None) -> Dict[str, Any]:
+                                 position: str = None, job_id: str = None) -> Dict[str, Any]:
         """Process resumes using multiple algorithms in parallel"""
         self.initialize_algorithms(algorithm_names)
 
@@ -157,7 +159,7 @@ class AlgorithmManager:
         if not available_algorithms:
             raise Exception("No algorithms available for processing")
 
-        logger.info(f"Processing {len(resume_texts)} resumes with {len(available_algorithms)} algorithms")
+        logger.info(f"Processing {len(resume_texts)} resumes with {len(available_algorithms)} algorithms (job_id={job_id})")
 
         results: Dict[str, Any] = {
             'metadata': {
@@ -175,12 +177,23 @@ class AlgorithmManager:
             future_to_algorithm = {}
             for alg_name in available_algorithms:
                 alg = self.algorithms[alg_name]
+                import inspect
                 if hasattr(alg, 'process_batch'):
-                    future = executor.submit(alg.process_batch, resume_texts, job_description, position)
+                    sig = inspect.signature(alg.process_batch)
+                    if 'job_id' in sig.parameters:
+                        future = executor.submit(alg.process_batch, resume_texts, job_description, position, job_id=job_id)
+                    else:
+                        future = executor.submit(alg.process_batch, resume_texts, job_description, position)
                 else:
-                    future = executor.submit(
-                        lambda: [alg.process_single(rt, job_description, position) for rt in resume_texts]
-                    )
+                    sig = inspect.signature(alg.process_single)
+                    if 'job_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        future = executor.submit(
+                            lambda a=alg: [a.process_single(rt, job_description, position, job_id=job_id) for rt in resume_texts]
+                        )
+                    else:
+                        future = executor.submit(
+                            lambda a=alg: [a.process_single(rt, job_description, position) for rt in resume_texts]
+                        )
                 future_to_algorithm[future] = alg_name
 
             for future in concurrent.futures.as_completed(future_to_algorithm):
@@ -230,10 +243,26 @@ class AlgorithmManager:
 
     def _combine_algorithm_results(self, individual_scores: Dict[str, List],
                                    total_resumes: int) -> List[Dict[str, Any]]:
-        """Combine scores from multiple algorithms with distinct, non-overlapping weights"""
+        """Combine scores from multiple algorithms using a clean 3-pillar weighted architecture"""
         combined_results: List[Dict[str, Any]] = []
 
+        # Weights of individual algorithms
         weights = self._resolve_weights()
+
+        # Pillar definition mapping
+        pillar_mapping = {
+            'semantic': {'bert', 'distilbert', 'sbert'},
+            'lexical': {'cosine', 'bm25', 'jaccard'},
+            'requirements': {'requirements', 'must_have', 'ner'}
+        }
+
+        # Global weights for the pillars
+        pillar_weights_cfg = self.config.get('pillar_weights', {})
+        pillar_weights = {
+            'semantic': float(pillar_weights_cfg.get('semantic', 0.40)),
+            'lexical': float(pillar_weights_cfg.get('lexical', 0.30)),
+            'requirements': float(pillar_weights_cfg.get('requirements', 0.30))
+        }
 
         for resume_idx in range(total_resumes):
             resume_result = {
@@ -243,17 +272,16 @@ class AlgorithmManager:
                 'weighted_score': 0.0,
                 'rank': 0,
                 'details': {'contributions': []},
+                'score_breakdown': {},
                 'errors': []
             }
 
-            total_weight = 0.0
-            score_sum = 0.0
-
+            # Collect active algorithms and their scores for the current resume
+            active_scores = {}
             for alg_name, alg_results in individual_scores.items():
                 if resume_idx < len(alg_results):
                     result = alg_results[resume_idx] or {}
                     if 'error' not in result:
-                        # Extract a numeric score, fallback to common keys
                         raw = result.get('score', None)
                         if raw is None:
                             details = result.get('details', {})
@@ -264,77 +292,152 @@ class AlgorithmManager:
                             logger.warning(f"{alg_name} returned non-numeric score for resume {resume_idx}. Defaulting to 0.")
                             score = 0.0
                         score = max(0.0, min(1.0, score))
-                        weight = float(weights.get(alg_name, 0.0))
+                        alg_weight = float(weights.get(alg_name, 0.0))
 
                         resume_result['algorithm_scores'][alg_name] = {
                             'score': score,
-                            'weight': weight,
+                            'weight': alg_weight,
                             'details': result.get('details', {})
                         }
-                        resume_result['details']['contributions'].append(
-                            {'alg': alg_name, 'score': score, 'weight': weight}
-                        )
-
-                        score_sum += score * weight
-                        total_weight += weight
+                        active_scores[alg_name] = {
+                            'score': score,
+                            'weight': alg_weight,
+                            'details': result.get('details', {})
+                        }
                     else:
                         resume_result['errors'].append({'algorithm': alg_name, 'error': result['error']})
 
-            if total_weight > 0:
-                resume_result['weighted_score'] = score_sum / total_weight
-                resume_result['combined_score'] = resume_result['weighted_score']
+            # Calculate scores for each pillar
+            pillar_scores = {}
+            active_pillars = []
+            
+            for pillar_name, alg_set in pillar_mapping.items():
+                pillar_active_algs = [alg for alg in alg_set if alg in active_scores]
+                if pillar_active_algs:
+                    # Calculate weighted average of active algorithms in this pillar
+                    sum_weighted_scores = 0.0
+                    sum_weights = 0.0
+                    for alg in pillar_active_algs:
+                        w = active_scores[alg]['weight']
+                        s = active_scores[alg]['score']
+                        sum_weighted_scores += s * w
+                        sum_weights += w
+                    
+                    # Fallback to simple average if all weights are 0
+                    if sum_weights > 0:
+                        pillar_scores[pillar_name] = sum_weighted_scores / sum_weights
+                    else:
+                        pillar_scores[pillar_name] = sum(active_scores[alg]['score'] for alg in pillar_active_algs) / len(pillar_active_algs)
+                    
+                    active_pillars.append(pillar_name)
+                else:
+                    pillar_scores[pillar_name] = 0.0
 
-            # Apply a soft must-have penalty. Requirements scoring already captures
-            # missing must-haves, so a hard 0.5 multiplier double-penalizes long JDs.
-            max_missing_must = 0
-            for alg_scores in resume_result['algorithm_scores'].values():
-                details = alg_scores.get('details', {})
-                must_ok = details.get('must_have_ok', True)
-                try:
-                    missing_must = int(details.get('missing_must_count', 0) or 0)
-                except Exception:
-                    missing_must = 0
-                max_missing_must = max(max_missing_must, missing_must)
-                if not must_ok or missing_must:
-                    per_missing = float(self.config.get('must_have_penalty_per_missing', 0.04))
-                    floor = float(self.config.get('must_have_penalty_floor', 0.75))
-                    multiplier = max(floor, 1.0 - (missing_must * per_missing))
-                    resume_result['combined_score'] *= multiplier
-                    resume_result['details']['must_have_penalty'] = {
-                        'missing_must_count': missing_must,
-                        'multiplier': multiplier,
-                    }
-                    break
+            # Calculate combined raw weighted score over active pillars
+            sum_pillar_weighted = 0.0
+            sum_pillar_weights = 0.0
+            for p in active_pillars:
+                sum_pillar_weighted += pillar_scores[p] * pillar_weights[p]
+                sum_pillar_weights += pillar_weights[p]
+
+            if sum_pillar_weights > 0:
+                raw_combined = sum_pillar_weighted / sum_pillar_weights
+            else:
+                raw_combined = 0.0
+
+            resume_result['weighted_score'] = raw_combined
+            resume_result['combined_score'] = raw_combined
+
+            # Gather penalties across all active algorithms
+            missing_must_count = 0
+            missing_must_list = []
+            constraints_ok = True
+            
+            for alg_name, data in active_scores.items():
+                details = data.get('details', {})
+                if 'missing_must_count' in details:
+                    try:
+                        missing_must_count = max(missing_must_count, int(details.get('missing_must_count', 0) or 0))
+                    except Exception:
+                        pass
+                if 'missing_must_have' in details:
+                    missing_must_list = list(set(missing_must_list + details.get('missing_must_have', [])))
                 if details.get('constraints_ok') is False:
-                    resume_result['combined_score'] *= 0.92
-                    resume_result['details']['constraints_penalty'] = {'multiplier': 0.92}
+                    constraints_ok = False
 
-            # Calibrate single-pair ATS-style scores: semantic relevance should be visible
-            # even when strict structured requirements are sparse or worded differently.
-            alg_scores = resume_result['algorithm_scores']
-            if 'sbert' in alg_scores:
-                sbert_score = float(alg_scores.get('sbert', {}).get('score', 0.0))
-                req_score = float(alg_scores.get('requirements', {}).get('score', 0.0))
-                bm25_score = float(alg_scores.get('bm25', {}).get('score', 0.0))
-                cosine_score = float(alg_scores.get('cosine', {}).get('score', 0.0))
-                lexical_score = max(bm25_score, cosine_score)
-                calibrated = (
-                    resume_result['weighted_score'] * 0.45
-                    + sbert_score * 0.35
-                    + req_score * 0.12
-                    + lexical_score * 0.08
-                )
-                if max_missing_must:
-                    calibrated *= max(0.90, 1.0 - (max_missing_must * 0.015))
-                if calibrated > resume_result['combined_score']:
-                    resume_result['details']['semantic_calibration'] = {
-                        'before': resume_result['combined_score'],
-                        'after': calibrated,
-                        'sbert': sbert_score,
-                        'requirements': req_score,
-                        'lexical': lexical_score,
-                    }
-                    resume_result['combined_score'] = calibrated
+            # Ensure missing_must_count matches our list length if list is populated
+            if missing_must_list:
+                missing_must_count = max(missing_must_count, len(missing_must_list))
+
+            # Calculate soft must-have penalty
+            must_have_multiplier = 1.0
+            if missing_must_count > 0:
+                per_missing = float(self.config.get('must_have_penalty_per_missing', 0.04))
+                floor = float(self.config.get('must_have_penalty_floor', 0.75))
+                must_have_multiplier = max(floor, 1.0 - (missing_must_count * per_missing))
+                resume_result['combined_score'] *= must_have_multiplier
+
+            # Calculate constraints penalty
+            constraints_multiplier = 1.0
+            if not constraints_ok:
+                constraints_multiplier = 0.92
+                resume_result['combined_score'] *= constraints_multiplier
+
+            # Construct structured score breakdown
+            semantic_weight_norm = pillar_weights['semantic'] / sum_pillar_weights if sum_pillar_weights > 0 and 'semantic' in active_pillars else 0.0
+            lexical_weight_norm = pillar_weights['lexical'] / sum_pillar_weights if sum_pillar_weights > 0 and 'lexical' in active_pillars else 0.0
+            req_weight_norm = pillar_weights['requirements'] / sum_pillar_weights if sum_pillar_weights > 0 and 'requirements' in active_pillars else 0.0
+
+            resume_result['score_breakdown'] = {
+                'semantic': {
+                    'score': float(pillar_scores['semantic']),
+                    'weight': float(semantic_weight_norm),
+                    'active': 'semantic' in active_pillars
+                },
+                'lexical': {
+                    'score': float(pillar_scores['lexical']),
+                    'weight': float(lexical_weight_norm),
+                    'active': 'lexical' in active_pillars
+                },
+                'requirements': {
+                    'score': float(pillar_scores['requirements']),
+                    'weight': float(req_weight_norm),
+                    'active': 'requirements' in active_pillars
+                },
+                'penalties': {
+                    'missing_must_count': int(missing_must_count),
+                    'missing_must_list': missing_must_list,
+                    'must_have_penalty_multiplier': float(must_have_multiplier),
+                    'constraints_ok': bool(constraints_ok),
+                    'constraints_penalty_multiplier': float(constraints_multiplier)
+                }
+            }
+
+            # Enrich requirements breakdown with specific sub-scores from RequirementsAnalyzer if available
+            for alg_name, data in active_scores.items():
+                if alg_name in ('requirements', 'must_have'):
+                    details = data.get('details', {})
+                    resume_result['score_breakdown']['requirements'].update({
+                        'must_have_score': float(details.get('must_have_score', 1.0)),
+                        'nice_to_have_score': float(details.get('nice_to_have_score', 1.0)),
+                        'constraints_score': float(details.get('constraints_score', 1.0)),
+                        'required_years_experience': int(details.get('required_years_experience', 0)),
+                        'resume_years_experience': int(details.get('resume_years_experience', 0)),
+                        'experience_ok': bool(details.get('experience_ok', True)),
+                        'missing_nice_to_have': details.get('missing_nice_to_have', []),
+                        'missing_constraints': details.get('missing_constraints', [])
+                    })
+                    break
+
+            # Populate contributions for backward-compatibility details mapping
+            for p_name, score in pillar_scores.items():
+                if p_name in active_pillars:
+                    w_norm = pillar_weights[p_name] / sum_pillar_weights
+                    resume_result['details']['contributions'].append({
+                        'alg': f"pillar_{p_name}",
+                        'score': float(score),
+                        'weight': float(w_norm)
+                    })
 
             combined_results.append(resume_result)
 

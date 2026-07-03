@@ -28,7 +28,7 @@ class VectorDB:
         return self._conn
 
     def init_tables(self):
-        """Create the job_profiles_vector table."""
+        """Create the job_profiles_vector table and ensure all model/version columns exist."""
         conn = self._get_connection()
         cur = conn.cursor()
         try:
@@ -39,8 +39,26 @@ class VectorDB:
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS bert_vector vector(768);
+            """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS distilbert_vector vector(768);
+            """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS checksum VARCHAR(64);
+            """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS version INT DEFAULT 1;
+            """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+            """)
+            cur.execute("""
+                ALTER TABLE job_profiles_vector ADD COLUMN IF NOT EXISTS job_text TEXT;
+            """)
             conn.commit()
-            logger.info("job_profiles_vector table initialized successfully")
+            logger.info("job_profiles_vector table initialized successfully with Version, Checksum & Job Text support")
         except Exception as e:
             conn.rollback()
             logger.error(f"Failed to initialize vector table: {e}")
@@ -48,39 +66,101 @@ class VectorDB:
         finally:
             cur.close()
 
-    def upsert_jd_vector(self, job_id: str, vector: list):
-        """Insert or update a JD vector embedding."""
+    def upsert_jd_vector(self, job_id: str, vector: list, checksum: str = ""):
+        """Insert or update a JD vector embedding (defaults to sBERT column)."""
+        self.upsert_jd_cache(job_id, checksum, 'sbert', vector)
+
+    def get_jd_vector(self, job_id: str):
+        """Retrieve a JD vector embedding by job_id (defaults to sBERT column)."""
+        cache = self.get_jd_cache(job_id)
+        return cache.get('sbert') if cache else None
+
+    def get_jd_cache(self, job_id: str) -> dict | None:
+        """Retrieve cache record for a job including all vectors, checksum, version, and job_text."""
         conn = self._get_connection()
         cur = conn.cursor()
         try:
             cur.execute("""
-                INSERT INTO job_profiles_vector (job_id, job_vector)
-                VALUES (%s, %s)
-                ON CONFLICT (job_id)
-                DO UPDATE SET job_vector = EXCLUDED.job_vector, created_at = NOW();
-            """, (job_id, vector))
-            conn.commit()
-            logger.info(f"Upserted vector for job_id={job_id}")
+                SELECT job_vector, bert_vector, distilbert_vector, checksum, version, job_text 
+                FROM job_profiles_vector 
+                WHERE job_id = %s;
+            """, (job_id,))
+            result = cur.fetchone()
+            if result:
+                return {
+                    'sbert': result[0].tolist() if result[0] is not None and hasattr(result[0], 'tolist') else result[0],
+                    'bert': result[1].tolist() if result[1] is not None and hasattr(result[1], 'tolist') else result[1],
+                    'distilbert': result[2].tolist() if result[2] is not None and hasattr(result[2], 'tolist') else result[2],
+                    'checksum': result[3],
+                    'version': result[4],
+                    'job_text': result[5]
+                }
+            return None
         except Exception as e:
-            conn.rollback()
-            logger.error(f"Failed to upsert vector for job_id={job_id}: {e}")
+            logger.error(f"Failed to get cache for job_id={job_id}: {e}")
             raise
         finally:
             cur.close()
 
-    def get_jd_vector(self, job_id: str):
-        """Retrieve a JD vector embedding by job_id."""
+    def upsert_jd_cache(self, job_id: str, checksum: str, model_name: str, vector: list, job_text: str = None):
+        """Upsert vector for a specific model under a specific checksum, managing versions and raw text."""
+        column_map = {
+            'sbert': 'job_vector',
+            'bert': 'bert_vector',
+            'distilbert': 'distilbert_vector'
+        }
+        col = column_map.get(model_name)
+        if not col:
+            raise ValueError(f"Unsupported model name for database caching: {model_name}")
+
         conn = self._get_connection()
         cur = conn.cursor()
         try:
-            cur.execute(
-                "SELECT job_vector FROM job_profiles_vector WHERE job_id = %s;",
-                (job_id,)
-            )
-            result = cur.fetchone()
-            return result[0] if result else None
+            # Check existing checksum
+            cur.execute("SELECT checksum, version FROM job_profiles_vector WHERE job_id = %s;", (job_id,))
+            row = cur.fetchone()
+
+            if row:
+                stored_checksum, stored_version = row[0], row[1]
+                if stored_checksum != checksum:
+                    # Checksum changed! Increment version and clear all other model vectors
+                    other_cols = [c for c in column_map.values() if c != col]
+                    set_clause = ", ".join([f"{c} = NULL" for c in other_cols])
+                    
+                    # Update row including new job_text
+                    cur.execute(f"""
+                        UPDATE job_profiles_vector
+                        SET {col} = %s, checksum = %s, version = %s, job_text = %s, {set_clause}, updated_at = NOW()
+                        WHERE job_id = %s;
+                    """, (vector, checksum, (stored_version or 1) + 1, job_text, job_id))
+                    logger.info(f"JD updated for {job_id}. Version bumped to {(stored_version or 1) + 1}, cleared other stale vectors.")
+                else:
+                    # Checksum matches, just update this model's vector
+                    if job_text is not None:
+                        cur.execute(f"""
+                            UPDATE job_profiles_vector
+                            SET {col} = %s, job_text = %s, updated_at = NOW()
+                            WHERE job_id = %s;
+                        """, (vector, job_text, job_id))
+                    else:
+                        cur.execute(f"""
+                            UPDATE job_profiles_vector
+                            SET {col} = %s, updated_at = NOW()
+                            WHERE job_id = %s;
+                        """, (vector, job_id))
+            else:
+                # No record exists. Insert new record as version 1
+                cur.execute(f"""
+                    INSERT INTO job_profiles_vector (job_id, checksum, version, job_text, {col})
+                    VALUES (%s, %s, 1, %s, %s);
+                """, (job_id, checksum, job_text, vector))
+                logger.info(f"Initialized new JD cache for {job_id} at version 1.")
+
+            conn.commit()
+            logger.info(f"Upserted {model_name} vector cache for job_id={job_id}")
         except Exception as e:
-            logger.error(f"Failed to get vector for job_id={job_id}: {e}")
+            conn.rollback()
+            logger.error(f"Failed to upsert cache for job_id={job_id}: {e}")
             raise
         finally:
             cur.close()

@@ -76,6 +76,7 @@ def create_app(config_name='default'):
         if db_url:
             vector_db = VectorDB(db_url, vec_dim)
             vector_db.init_tables()
+            algorithm_manager.vector_db = vector_db
             logger.info("Vector database initialized successfully")
     except Exception as e:
         logger.warning(f"Vector database not available: {e}. JD pre-computation endpoints will be disabled.")
@@ -279,30 +280,52 @@ def create_app(config_name='default'):
         if not job_text and isinstance(data.get('job'), dict):
             job_text = _job_json_to_text(data.get('job'))
 
+        # Also accept requirements and prepend them
+        requirements_text = _requirements_to_text(data.get('requirements'))
+        if requirements_text:
+            job_text = "\n\n".join([requirements_text, job_text]).strip()
+
         if not job_id:
             return jsonify({'error': 'job_id is required'}), 400
         if not job_text:
-            return jsonify({'error': 'job_text (or job JSON) is required'}), 400
+            return jsonify({'error': 'job_text, job JSON, or requirements is required'}), 400
 
         try:
-            # Ensure sBERT model is loaded
-            algorithm_manager.initialize_algorithms(['sbert'])
+            # Ensure semantic models are loaded
+            models_to_load = []
+            for m in ['sbert', 'bert', 'distilbert']:
+                if m in algorithm_manager.algorithm_registry:
+                    models_to_load.append(m)
+
+            algorithm_manager.initialize_algorithms(models_to_load)
+
+            import hashlib
+            checksum = hashlib.sha256(job_text.encode('utf-8')).hexdigest()
+
+            # Encode and upsert for each active model
+            # sBERT
             sbert_alg = algorithm_manager.algorithms.get('sbert')
-            if not sbert_alg or not hasattr(sbert_alg, 'model'):
-                return jsonify({'error': 'sBERT model is not available'}), 503
+            if sbert_alg and hasattr(sbert_alg, 'model'):
+                sbert_vector = sbert_alg.model.encode([job_text])[0].tolist()
+                vector_db.upsert_jd_cache(job_id, checksum, 'sbert', sbert_vector, job_text=job_text)
 
-            # Encode JD text into vector
-            embedding = sbert_alg.model.encode([job_text])[0]
-            vector_list = embedding.tolist()
+            # BERT
+            bert_alg = algorithm_manager.algorithms.get('bert')
+            if bert_alg and hasattr(bert_alg, '_get_embeddings'):
+                bert_vector = bert_alg._get_embeddings(job_text)[0].tolist()
+                vector_db.upsert_jd_cache(job_id, checksum, 'bert', bert_vector, job_text=job_text)
 
-            # Store in PostgreSQL
-            vector_db.upsert_jd_vector(job_id, vector_list)
+            # DistilBERT
+            distilbert_alg = algorithm_manager.algorithms.get('distilbert')
+            if distilbert_alg and hasattr(distilbert_alg, '_embed'):
+                cleaned = distilbert_alg._clean(job_text)
+                distilbert_vector = distilbert_alg._embed(cleaned)[0].tolist()
+                vector_db.upsert_jd_cache(job_id, checksum, 'distilbert', distilbert_vector, job_text=job_text)
 
             return jsonify({
                 'success': True,
                 'job_id': job_id,
-                'vector_dimension': len(vector_list),
-                'message': 'JD vectorized and stored successfully'
+                'message': 'JD vectorized and stored successfully across semantic models'
             }), 200
 
         except Exception as e:
@@ -422,6 +445,7 @@ def create_app(config_name='default'):
             successful_files = []
             failed_files = []
             resume_texts = []
+            job_id = None
 
             if request.is_json:
                 payload = request.get_json(silent=True) or {}
@@ -433,13 +457,18 @@ def create_app(config_name='default'):
 
                 options = payload.get('options') if isinstance(payload.get('options'), dict) else {}
                 metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                job_id = metadata.get('jobId') or metadata.get('job_id') or payload.get('job_id')
 
-                job_description = str(payload.get('jobDescription') or '').strip()
-                if not job_description and isinstance(payload.get('job'), dict):
-                    job_description = _job_json_to_text(payload.get('job'))
-                requirements_text = _requirements_to_text(payload.get('requirements'))
-                if requirements_text:
-                    job_description = "\n\n".join([requirements_text, job_description]).strip()
+                if not job_id:
+                    return jsonify({'error': 'job_id is required in metadata or request payload'}), 400
+                if not vector_db:
+                    return jsonify({'error': 'Vector database is not configured/available'}), 503
+
+                jd_cache = vector_db.get_jd_cache(job_id)
+                if not jd_cache or not jd_cache.get('job_text'):
+                    return jsonify({'error': f"Job ID {job_id} not found in database cache. Please vectorize the JD first."}), 404
+
+                job_description = jd_cache['job_text']
 
                 resumes = payload.get('resumes') or payload.get('cvs') or payload.get('cv') or []
                 if isinstance(resumes, (dict, str)):
@@ -484,7 +513,6 @@ def create_app(config_name='default'):
 
             else:
                 files = request.files.getlist('resumes')
-                job_description = request.form.get('jobDescription', '').strip()
                 position = request.form.get('position', 'general')
                 methods = request.form.getlist('methods') or default_methods
 
@@ -501,6 +529,18 @@ def create_app(config_name='default'):
                     metadata = json.loads(metadata_str)
                 except json.JSONDecodeError:
                     metadata = {}
+                job_id = metadata.get('jobId') or metadata.get('job_id')
+
+                if not job_id:
+                    return jsonify({'error': 'job_id is required in metadata form field'}), 400
+                if not vector_db:
+                    return jsonify({'error': 'Vector database is not configured/available'}), 503
+
+                jd_cache = vector_db.get_jd_cache(job_id)
+                if not jd_cache or not jd_cache.get('job_text'):
+                    return jsonify({'error': f"Job ID {job_id} not found in database cache. Please vectorize the JD first."}), 404
+
+                job_description = jd_cache['job_text']
 
                 logger.info(f"Processing multipart request: {len(files)} files, {len(methods)} algorithms")
 
@@ -521,7 +561,7 @@ def create_app(config_name='default'):
                 resume_texts = [f['text'] for f in successful_files]
             
             algorithm_results = algorithm_manager.process_resumes_parallel(
-                resume_texts, job_description, methods, position
+                resume_texts, job_description, methods, position, job_id=job_id
             )
             
             # Calculate processing time
@@ -570,6 +610,7 @@ def create_app(config_name='default'):
                     'final_score': float(combined_result['combined_score']),
                     'weighted_score': float(combined_result['weighted_score']),
                     'scores': {alg: float(data['score']) for alg, data in combined_result['algorithm_scores'].items()},
+                    'score_breakdown': convert_to_json_serializable(combined_result.get('score_breakdown', {})),
                     'explanation': explanation,
                     'extracted_skills': extracted_skills[:20],
                     'file_info': {
@@ -604,11 +645,11 @@ def create_app(config_name='default'):
                 'timestamp': datetime.utcnow().isoformat()
             }), 500
 
-    def _generate_explanation(combined_result: dict, job_description: str, position: str) -> str:
-        """Generate human-readable explanation for ranking"""
+    def _generate_explanation(combined_result: dict, job_description: str, position: str = None) -> str:
+        """Generate human-readable explanation for ranking based on the three-pillar architecture"""
         try:
             score = float(combined_result['combined_score'])
-            algorithm_scores = combined_result['algorithm_scores']
+            breakdown = combined_result.get('score_breakdown', {})
             
             if score >= 0.8:
                 rating = "Excellent match"
@@ -618,30 +659,62 @@ def create_app(config_name='default'):
                 rating = "Fair match"
             else:
                 rating = "Poor match"
+                
+            pos_str = f" for {position}" if position else ""
+            explanation_parts = [f"{rating}{pos_str} (Overall: {score:.1%})."]
             
-            # Find best performing algorithm
-            best_alg = max(algorithm_scores.keys(), 
-                          key=lambda k: float(algorithm_scores[k]['score']), 
-                          default='unknown')
-            best_score = float(algorithm_scores.get(best_alg, {}).get('score', 0))
+            # Semantic feedback
+            if breakdown.get('semantic', {}).get('active'):
+                sem_score = breakdown['semantic']['score']
+                if sem_score >= 0.75:
+                    explanation_parts.append(f"Strong semantic alignment with the job context ({sem_score:.1%}).")
+                elif sem_score < 0.50:
+                    explanation_parts.append(f"Weak semantic match with the role's requirements ({sem_score:.1%}).")
+                    
+            # Lexical feedback
+            if breakdown.get('lexical', {}).get('active'):
+                lex_score = breakdown['lexical']['score']
+                # Try to extract key matching terms from cosine or bm25
+                matching_terms = []
+                for alg_name in ('cosine', 'bm25', 'jaccard'):
+                    alg_data = combined_result['algorithm_scores'].get(alg_name, {})
+                    top_terms = alg_data.get('details', {}).get('top_matching_terms', [])
+                    if top_terms:
+                        if isinstance(top_terms[0], dict):
+                            matching_terms = [t['term'] for t in top_terms[:3]]
+                        else:
+                            matching_terms = [str(t) for t in top_terms[:3]]
+                        break
+                    
+                term_str = f" (key matches: {', '.join(matching_terms)})" if matching_terms else ""
+                if lex_score >= 0.60:
+                    explanation_parts.append(f"Good keyword matching{term_str}.")
+                    
+            # Requirements & penalties feedback
+            penalties = breakdown.get('penalties', {})
+            missing_must_count = penalties.get('missing_must_count', 0)
+            missing_list = penalties.get('missing_must_list', [])
             
-            explanation = f"{rating} for {position} position (Overall: {score:.1%}). "
-            explanation += f"Strongest performance in {best_alg.upper()} analysis ({best_score:.1%}). "
-
-            # Add algorithm-specific insights
-            if 'ner' in algorithm_scores:
-                ner_details = algorithm_scores['ner'].get('details', {})
-                skill_categories = len(ner_details.get('extracted_skills', {}))
-                if skill_categories > 0:
-                    explanation += f"Identified skills across {skill_categories} categories. "
+            # Get experience details if available
+            req_info = breakdown.get('requirements', {})
+            has_exp_info = 'required_years_experience' in req_info
             
-            if 'cosine' in algorithm_scores:
-                cosine_details = algorithm_scores['cosine'].get('details', {})
-                matching_terms = len(cosine_details.get('top_matching_terms', []))
-                if matching_terms > 0:
-                    explanation += f"Found {matching_terms} key matching terms. "
+            if has_exp_info:
+                req_yrs = req_info.get('required_years_experience', 0)
+                res_yrs = req_info.get('resume_years_experience', 0)
+                if req_yrs > 0:
+                    explanation_parts.append(f"Experience: {res_yrs} years found (Required: {req_yrs} years).")
             
-            return explanation
+            if missing_must_count > 0:
+                must_have_mult = penalties.get('must_have_penalty_multiplier', 1.0)
+                penalty_pct = (1.0 - must_have_mult) * 100
+                list_str = f" ({', '.join(missing_list[:3])})" if missing_list else ""
+                explanation_parts.append(f"Missing {missing_must_count} must-have requirement(s){list_str}, resulting in a -{penalty_pct:.0f}% penalty.")
+                
+            if penalties.get('constraints_ok') is False:
+                explanation_parts.append("Failed one or more constraints (e.g., location or language), applying a -8% penalty.")
+                
+            return " ".join(explanation_parts)
             
         except Exception as e:
             logger.error(f"Error generating explanation: {e}")

@@ -56,8 +56,39 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             sum_mask = torch.clamp(mask_exp.sum(dim=1), min=1e-9)
             return (sum_emb / sum_mask).cpu().numpy()
     
+    def _get_jd_embedding(self, job_description: str, job_id: str = None) -> np.ndarray:
+        """Retrieve JD embedding using pgvector database cache with checksum and version verification for DistilBERT."""
+        import hashlib
+        checksum = hashlib.sha256(job_description.encode('utf-8')).hexdigest()
+
+        vector_db = getattr(self, 'vector_db', None)
+        if job_id and vector_db:
+            try:
+                cache = vector_db.get_jd_cache(job_id)
+                if cache and cache.get('checksum') == checksum:
+                    db_vector = cache.get('distilbert')
+                    if db_vector is not None:
+                        logger.info(f"DistilBERT Cache Hit (DB): JD embedding retrieved from pgvector (version={cache.get('version')})")
+                        return np.array([db_vector])  # shape (1, 768)
+            except Exception as e:
+                logger.warning(f"Failed to fetch DistilBERT vector from database cache: {e}")
+
+        # Cache miss: Compute DistilBERT embedding
+        logger.info("DistilBERT Cache Miss: Encoding clean JD text using model")
+        j_clean = self._clean(job_description)
+        embedding = self._embed(j_clean)  # shape (1, 768)
+
+        # Save to Database Cache
+        if job_id and vector_db:
+            try:
+                vector_db.upsert_jd_cache(job_id, checksum, 'distilbert', embedding[0].tolist())
+            except Exception as e:
+                logger.warning(f"Failed to save DistilBERT embedding to database cache: {e}")
+
+        return embedding
+
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None) -> dict:
+                      position: str = None, job_id: str = None) -> dict:
         """INTELLIGENT multi-metric scoring with penalties"""
         if not self.is_loaded:
             self.load_model()
@@ -71,7 +102,7 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             
             # === METRIC 1: BERT Semantic Similarity (baseline) ===
             r_emb = self._embed(r_clean)
-            j_emb = self._embed(j_clean)
+            j_emb = self._get_jd_embedding(job_description, job_id)
             bert_sim = float(cosine_similarity(r_emb, j_emb)[0][0])
             
             # Normalize BERT score (it's naturally 0.85-0.99, map to 0.3-0.9)

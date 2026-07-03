@@ -27,12 +27,12 @@ class BaseAlgorithm(ABC):
     
     @abstractmethod
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None) -> Dict[str, Any]:
+                      position: str = None, **kwargs) -> Dict[str, Any]:
         """Process a single resume and return score with details"""
         pass
     
     def process_batch(self, resume_texts: List[str], job_description: str, 
-                     position: str = None) -> List[Dict[str, Any]]:
+                     position: str = None, job_id: str = None) -> List[Dict[str, Any]]:
         """Process multiple resumes in batch"""
         if not self.is_loaded:
             self.load_model()
@@ -43,7 +43,12 @@ class BaseAlgorithm(ABC):
         try:
             for i, resume_text in enumerate(resume_texts):
                 try:
-                    result = self.process_single(resume_text, job_description, position)
+                    import inspect
+                    sig = inspect.signature(self.process_single)
+                    if 'job_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        result = self.process_single(resume_text, job_description, position, job_id=job_id)
+                    else:
+                        result = self.process_single(resume_text, job_description, position)
                     result['resume_index'] = i
                     results.append(result)
                     self._performance_metrics['total_processed'] += 1

@@ -10,8 +10,8 @@ import json
 import numpy as np
 
 from config.settings import config_dict
-from core.algorithm_manager import AlgorithmManager
-from core.vector_db import VectorDB
+from modules.matching.manager import AlgorithmManager
+from modules.matching.vector_db import VectorDB
 from utils.file_processor import FileProcessor
 from utils.validators import RequestValidator
 from api.error_handlers import register_error_handlers

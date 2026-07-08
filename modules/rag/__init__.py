@@ -19,6 +19,9 @@ from modules.rag.vector_insert import (
     upsert_interview_document,
 )
 from modules.rag.retriever import Retriever
+from modules.rag.quality_layer import QualityLayer
+from modules.rag.prompt_builder import PromptBuilder
+from modules.rag.llm import LLMService
 
 __all__ = [
     "EmbeddingAdapter",
@@ -33,4 +36,7 @@ __all__ = [
     "upsert_vectors",
     "upsert_interview_document",
     "Retriever",
+    "QualityLayer",
+    "PromptBuilder",
+    "LLMService",
 ]

@@ -16,6 +16,7 @@ from utils.file_processor import FileProcessor
 from utils.validators import RequestValidator
 from api.error_handlers import register_error_handlers
 from api.middleware import setup_middleware
+from modules.rag import Retriever, QualityLayer, PromptBuilder, LLMService
 
 # Configure logging
 logging.basicConfig(
@@ -82,6 +83,12 @@ def create_app(config_name='default'):
         logger.warning(f"Vector database not available: {e}. JD pre-computation endpoints will be disabled.")
         vector_db = None
     
+    # Initialize RAG components
+    retriever = Retriever()
+    quality_layer = QualityLayer()
+    prompt_builder = PromptBuilder()
+    llm_service = LLMService()
+
     # Create upload directory
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -405,6 +412,321 @@ def create_app(config_name='default'):
 
         except Exception as e:
             logger.error(f"CV-JD match error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    # ===== RAG AI SERVICE ENDPOINTS =====
+
+    @app.route('/retrieve', methods=['GET', 'POST'])
+    @app.route('/api/v1/rag/retrieve', methods=['GET', 'POST'])
+    def rag_retrieve():
+        """Retrieve and process clean context chunks for interview prep."""
+        try:
+            if request.method == 'POST':
+                data = request.get_json(silent=True) or {}
+            else:
+                data = request.args
+
+            topic = data.get('topic')
+            difficulty = data.get('difficulty')
+            history = data.get('history')
+            query_text = data.get('query_text')
+            k = int(data.get('k', 5))
+
+            raw_chunks = retriever.retrieve(
+                topic=topic,
+                difficulty=difficulty,
+                history=history,
+                query_text=query_text,
+                k=k
+            )
+            processed_res = quality_layer.process(
+                raw_chunks,
+                topic=topic,
+                difficulty=difficulty,
+                k=k
+            )
+
+            return jsonify({
+                'success': True,
+                'data': convert_to_json_serializable(processed_res)
+            }), 200
+
+        except Exception as e:
+            logger.error(f"RAG retrieve API error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/interview', methods=['POST'])
+    @app.route('/api/v1/rag/interview', methods=['POST'])
+    def rag_interview():
+        """Generate a new question or follow-up question based on interview context."""
+        try:
+            data = request.get_json(silent=True) or {}
+            topic = data.get('topic')
+            difficulty = data.get('difficulty')
+            history = data.get('history')  # list of chunk_ids
+            conv_history = data.get('conversation_history')  # list of turns
+            last_question = data.get('last_question')
+            candidate_answer = data.get('candidate_answer')
+
+            if not topic:
+                return jsonify({'error': 'topic is required'}), 400
+            if not difficulty:
+                return jsonify({'error': 'difficulty is required'}), 400
+
+            # 1. Retrieve & filter context chunks
+            raw_chunks = retriever.retrieve(
+                topic=topic,
+                difficulty=difficulty,
+                history=history,
+                k=5
+            )
+            processed = quality_layer.process(
+                raw_chunks,
+                topic=topic,
+                difficulty=difficulty
+            )
+
+            # 2. Decide if follow-up or initial question
+            if candidate_answer and last_question:
+                prompt = prompt_builder.build_follow_up_prompt(
+                    context_chunks=processed['follow_ups'],
+                    history=conv_history or [],
+                    last_question=last_question,
+                    candidate_answer=candidate_answer
+                )
+                q_type = "follow_up"
+            else:
+                prompt = prompt_builder.build_question_generation_prompt(
+                    context_chunks=processed['ranked_chunks'],
+                    topic=topic,
+                    difficulty=difficulty,
+                    history=history
+                )
+                q_type = "initial"
+
+            # 3. Call LLM to generate the question
+            question_text = llm_service.generate_text(prompt)
+
+            return jsonify({
+                'success': True,
+                'question': question_text.strip(),
+                'type': q_type,
+                'prompt': prompt
+            }), 200
+
+        except Exception as e:
+            logger.error(f"RAG interview API error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/evaluate', methods=['POST'])
+    @app.route('/api/v1/rag/evaluate', methods=['POST'])
+    def rag_evaluate():
+        """Evaluate candidate's answer and generate constructive feedback."""
+        try:
+            data = request.get_json(silent=True) or {}
+            question = data.get('question')
+            candidate_answer = data.get('candidate_answer')
+            topic = data.get('topic')
+            difficulty = data.get('difficulty')
+
+            if not question:
+                return jsonify({'error': 'question is required'}), 400
+            if not candidate_answer:
+                return jsonify({'error': 'candidate_answer is required'}), 400
+
+            # 1. Retrieve criteria chunks
+            raw_chunks = retriever.retrieve(
+                topic=topic,
+                difficulty=difficulty,
+                query_text=question,
+                k=5
+            )
+            processed = quality_layer.process(
+                raw_chunks,
+                topic=topic,
+                difficulty=difficulty
+            )
+
+            # 2. Build and run evaluation prompt
+            eval_prompt = prompt_builder.build_evaluation_prompt(
+                context_chunks=processed['ranked_chunks'],
+                question=question,
+                candidate_answer=candidate_answer
+            )
+            eval_raw = llm_service.generate_text(eval_prompt)
+
+            # Parse evaluation result if LLM returned valid JSON
+            try:
+                evaluation_data = json.loads(eval_raw)
+            except Exception:
+                evaluation_data = eval_raw
+
+            # 3. Build and run feedback prompt (coaching)
+            feedback_prompt = prompt_builder.build_feedback_prompt(
+                evaluation_details=eval_raw,
+                deliverables=processed['deliverables']
+            )
+            feedback_text = llm_service.generate_text(feedback_prompt)
+
+            return jsonify({
+                'success': True,
+                'evaluation': evaluation_data,
+                'feedback': feedback_text.strip()
+            }), 200
+
+        except Exception as e:
+            logger.error(f"RAG evaluate API error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/import-csv', methods=['POST'])
+    @app.route('/api/v1/rag/import-csv', methods=['POST'])
+    def rag_import_csv():
+        """Import multiple interview documents from a CSV file."""
+        import csv
+        import io
+        from modules.rag import upsert_interview_document
+
+        try:
+            file = request.files.get('file')
+            if not file:
+                return jsonify({'error': 'No file uploaded under key "file"'}), 400
+
+            filename = file.filename or ''
+            if not filename.endswith('.csv'):
+                return jsonify({'error': 'Uploaded file must be a CSV file (.csv)'}), 400
+
+            # Decode stream
+            try:
+                stream = io.StringIO(file.stream.read().decode("utf-8-sig"), newline=None)
+            except Exception as dec_err:
+                logger.error(f"Failed to decode CSV file: {dec_err}")
+                return jsonify({'error': 'Failed to decode CSV file. Ensure it is encoded in UTF-8.'}), 400
+
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames:
+                return jsonify({'error': 'CSV file is empty or missing headers'}), 400
+
+            def _parse_csv_list(val: Any) -> list:
+                if not val:
+                    return []
+                val_str = str(val).strip()
+                if not val_str:
+                    return []
+                # Split by semicolon or newline
+                delimiters = [';', '\n']
+                parts = [val_str]
+                for delim in delimiters:
+                    new_parts = []
+                    for p in parts:
+                        new_parts.extend(p.split(delim))
+                    parts = new_parts
+                return [p.strip() for p in parts if p.strip()]
+
+            imported_docs = []
+            failed_rows = []
+
+            for idx, row in enumerate(reader, 1):
+                # Clean headers and values
+                row_clean = {str(k).strip().lower(): v for k, v in row.items() if k is not None}
+
+                doc_id = row_clean.get('document_id') or row_clean.get('id')
+                topic_name = row_clean.get('topic_name') or row_clean.get('topic')
+                difficulty_level = row_clean.get('difficulty_level') or row_clean.get('difficulty') or row_clean.get('level')
+
+                # Skip completely empty rows or rows missing identity
+                if not doc_id and not topic_name:
+                    continue
+
+                if not doc_id:
+                    failed_rows.append({'row': idx, 'error': 'Missing document_id or id'})
+                    continue
+                if not topic_name:
+                    failed_rows.append({'row': idx, 'error': 'Missing topic_name or topic'})
+                    continue
+
+                # Build nested document object matching schema
+                doc_obj = {
+                    "document": {
+                        "document_id": str(doc_id).strip(),
+                        "version": str(row_clean.get('version', '1.0.0')).strip(),
+                        "status": str(row_clean.get('status', 'approved')).strip(),
+                        "language": str(row_clean.get('language', 'vi')).strip()
+                    },
+                    "topic": {
+                        "domain": str(row_clean.get('domain', 'general')).strip(),
+                        "topic_name": str(topic_name).strip(),
+                        "role_targets": _parse_csv_list(row_clean.get('role_targets') or row_clean.get('roles')),
+                        "job_levels": _parse_csv_list(row_clean.get('job_levels') or row_clean.get('levels'))
+                    },
+                    "difficulty": {
+                        "level": str(difficulty_level or 'intermediate').strip()
+                    },
+                    "knowledge": {
+                        "summary": str(row_clean.get('knowledge_summary') or row_clean.get('knowledge') or row_clean.get('summary') or '').strip(),
+                        "concepts": _parse_csv_list(row_clean.get('knowledge_concepts') or row_clean.get('concepts'))
+                    },
+                    "expected_points": {
+                        "must_have": _parse_csv_list(row_clean.get('expected_points_must_have') or row_clean.get('expected_points') or row_clean.get('must_have'))
+                    },
+                    "common_mistakes": {
+                        "mistakes": _parse_csv_list(row_clean.get('common_mistakes') or row_clean.get('mistakes'))
+                    },
+                    "follow_up": {
+                        "questions": _parse_csv_list(row_clean.get('follow_up_questions') or row_clean.get('follow_up'))
+                    },
+                    "deliverables": {
+                        "action_items": _parse_csv_list(row_clean.get('deliverables_action_items') or row_clean.get('deliverables') or row_clean.get('action_items'))
+                    },
+                    "metadata": {
+                        "retrieval": {
+                            "is_active": str(row_clean.get('is_active', 'true')).strip().lower() in ('true', '1', 'yes'),
+                            "quality_score": float(row_clean.get('quality_score') or 0.8)
+                        }
+                    }
+                }
+
+                try:
+                    upsert_interview_document(document_obj=doc_obj)
+                    imported_docs.append(str(doc_id).strip())
+                except Exception as row_err:
+                    logger.error(f"Failed to upsert RAG document from CSV row {idx}: {row_err}")
+                    failed_rows.append({'row': idx, 'document_id': doc_id, 'error': str(row_err)})
+
+            return jsonify({
+                'success': True,
+                'message': f'Imported {len(imported_docs)} documents successfully from CSV.',
+                'imported_document_ids': imported_docs,
+                'failed_rows': failed_rows
+            }), 200
+
+        except Exception as e:
+            logger.error(f"RAG import-csv API error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/upsert-document', methods=['POST'])
+    @app.route('/api/v1/rag/upsert-document', methods=['POST'])
+    def rag_upsert_document():
+        """Upsert a single interview document from a raw JSON payload."""
+        from modules.rag import upsert_interview_document
+        try:
+            data = request.get_json(silent=True) or {}
+            doc_id = data.get('document', {}).get('document_id')
+            if not doc_id:
+                return jsonify({'error': 'document.document_id is required'}), 400
+
+            res = upsert_interview_document(document_obj=data)
+            return jsonify({
+                'success': True,
+                'message': f"Document '{doc_id}' upserted successfully.",
+                'records': res.get('records', 0)
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG upsert-document API error: {e}")
             logger.error(traceback.format_exc())
             return jsonify({'error': str(e)}), 500
 

@@ -8,6 +8,7 @@ from datetime import datetime
 import traceback
 import json
 import numpy as np
+from typing import Any
 
 from config.settings import config_dict
 from modules.matching.manager import AlgorithmManager
@@ -16,7 +17,7 @@ from utils.file_processor import FileProcessor
 from utils.validators import RequestValidator
 from api.error_handlers import register_error_handlers
 from api.middleware import setup_middleware
-from modules.rag import Retriever, QualityLayer, PromptBuilder, LLMService
+from modules.rag import Retriever, QualityLayer, PromptBuilder, LLMService, VectorStoreAdapter
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +47,48 @@ def convert_to_json_serializable(obj):
         return obj.item()
     else:
         return obj
+
+
+def parse_json_from_llm(raw_text: str) -> dict:
+    """Extract and parse JSON object robustly from LLM responses, even if wrapped in markdown code blocks."""
+    if not raw_text:
+        return {}
+    
+    clean_text = raw_text.strip()
+    
+    # 1. Try parsing directly
+    try:
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        pass
+        
+    # 2. Try extracting from markdown code block ```json ... ```
+    if "```" in clean_text:
+        parts = clean_text.split("```")
+        for part in parts:
+            part_clean = part.strip()
+            if part_clean.lower().startswith("json"):
+                part_clean = part_clean[4:].strip()
+            try:
+                return json.loads(part_clean)
+            except json.JSONDecodeError:
+                pass
+                
+    # 3. Try finding first '{' and last '}'
+    start_idx = clean_text.find('{')
+    end_idx = clean_text.rfind('}')
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        json_candidate = clean_text[start_idx:end_idx + 1].strip()
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+            
+    # Fallback: return raw text inside dictionary
+    return {
+        "raw_text": raw_text,
+        "parsing_failed": True
+    }
 
 def create_app(config_name='default'):
     """Application factory"""
@@ -440,16 +483,35 @@ def create_app(config_name='default'):
                 query_text=query_text,
                 k=k
             )
-            processed_res = quality_layer.process(
+            similarity_weight = data.get('similarity_weight')
+            quality_weight = data.get('quality_weight')
+            if similarity_weight is not None and quality_weight is not None:
+                ql = QualityLayer(
+                    similarity_weight=float(similarity_weight),
+                    quality_weight=float(quality_weight)
+                )
+            else:
+                ql = quality_layer
+
+            processed_res = ql.process(
                 raw_chunks,
                 topic=topic,
                 difficulty=difficulty,
                 k=k
             )
 
+            prompt_preview = prompt_builder.build_question_generation_prompt(
+                context_chunks=processed_res['ranked_chunks'],
+                topic=topic or "Python OOP",
+                difficulty=difficulty or "intermediate"
+            )
+
+            res_dict = dict(processed_res)
+            res_dict['prompt_preview'] = prompt_preview
+
             return jsonify({
                 'success': True,
-                'data': convert_to_json_serializable(processed_res)
+                'data': convert_to_json_serializable(res_dict)
             }), 200
 
         except Exception as e:
@@ -559,14 +621,11 @@ def create_app(config_name='default'):
             eval_raw = llm_service.generate_text(eval_prompt)
 
             # Parse evaluation result if LLM returned valid JSON
-            try:
-                evaluation_data = json.loads(eval_raw)
-            except Exception:
-                evaluation_data = eval_raw
+            evaluation_data = parse_json_from_llm(eval_raw)
 
             # 3. Build and run feedback prompt (coaching)
             feedback_prompt = prompt_builder.build_feedback_prompt(
-                evaluation_details=eval_raw,
+                evaluation_details=evaluation_data,
                 deliverables=processed['deliverables']
             )
             feedback_text = llm_service.generate_text(feedback_prompt)
@@ -727,6 +786,218 @@ def create_app(config_name='default'):
             }), 200
         except Exception as e:
             logger.error(f"RAG upsert-document API error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents', methods=['GET'])
+    def rag_list_documents():
+        """List all unique documents in the RAG knowledge base."""
+        try:
+            adapter = VectorStoreAdapter()
+            docs = adapter.get_all_documents()
+            return jsonify({
+                'success': True,
+                'data': docs
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG list-documents API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents/<document_id>', methods=['GET'])
+    def rag_get_document(document_id):
+        """Get a document's reconstructed details and all its chunks."""
+        try:
+            adapter = VectorStoreAdapter()
+            chunks = adapter.get_document_chunks(document_id)
+            if not chunks:
+                return jsonify({'error': f"Document '{document_id}' not found"}), 404
+            
+            doc_obj = {
+                "document": {
+                    "document_id": document_id,
+                    "version": "1.0.0",
+                    "status": "approved",
+                    "language": "vi",
+                    "updated_at": ""
+                },
+                "topic": {
+                    "domain": "general",
+                    "topic_name": "",
+                    "role_targets": [],
+                    "job_levels": []
+                },
+                "difficulty": {
+                    "level": "intermediate"
+                },
+                "knowledge": {
+                    "summary": "",
+                    "concepts": []
+                },
+                "expected_points": {
+                    "must_have": []
+                },
+                "common_mistakes": {
+                    "mistakes": []
+                },
+                "follow_up": {
+                    "questions": []
+                },
+                "deliverables": {
+                    "action_items": []
+                },
+                "metadata": {
+                    "retrieval": {
+                        "is_active": True,
+                        "quality_score": 0.8
+                    }
+                }
+            }
+            
+            for chunk in chunks:
+                meta = chunk.get("metadata", {})
+                doc_obj["document"]["version"] = meta.get("version", "1.0.0")
+                doc_obj["document"]["language"] = meta.get("language", "vi")
+                doc_obj["document"]["updated_at"] = meta.get("updated_at", "")
+                doc_obj["topic"]["domain"] = meta.get("domain", "general")
+                doc_obj["topic"]["topic_name"] = meta.get("topic", "")
+                doc_obj["topic"]["role_targets"] = meta.get("roles", [])
+                doc_obj["topic"]["job_levels"] = meta.get("job_levels", [])
+                doc_obj["difficulty"]["level"] = meta.get("difficulty", "intermediate")
+                doc_obj["metadata"]["retrieval"]["is_active"] = meta.get("is_active", True)
+                doc_obj["metadata"]["retrieval"]["quality_score"] = meta.get("quality_score", 0.8)
+                
+                c_type = meta.get("chunk_type")
+                text = chunk.get("text", "")
+                if c_type == "knowledge":
+                    lines = text.split('\n')
+                    summary_lines = []
+                    concepts_lines = []
+                    in_concepts = False
+                    for line in lines:
+                        if line.startswith("summary:"):
+                            summary_lines.append(line.replace("summary:", "", 1).strip())
+                        elif line.startswith("concepts:"):
+                            in_concepts = True
+                            concepts_lines.append(line.replace("concepts:", "", 1).strip())
+                        else:
+                            if in_concepts:
+                                concepts_lines.append(line.strip())
+                            else:
+                                summary_lines.append(line.strip())
+                    doc_obj["knowledge"]["summary"] = "\n".join(summary_lines).strip()
+                    doc_obj["knowledge"]["concepts"] = concepts_lines
+                elif c_type == "expected_points":
+                    lines = [l.replace("must_have:", "", 1).strip() if l.startswith("must_have:") else l.strip() for l in text.split('\n') if l.strip()]
+                    doc_obj["expected_points"]["must_have"] = lines
+                elif c_type == "common_mistakes":
+                    lines = [l.replace("mistakes:", "", 1).strip() if l.startswith("mistakes:") else l.strip() for l in text.split('\n') if l.strip()]
+                    doc_obj["common_mistakes"]["mistakes"] = lines
+                elif c_type == "follow_up":
+                    lines = [l.replace("questions:", "", 1).strip() if l.startswith("questions:") else l.strip() for l in text.split('\n') if l.strip()]
+                    doc_obj["follow_up"]["questions"] = lines
+                elif c_type == "deliverables":
+                    lines = [l.replace("action_items:", "", 1).strip() if l.startswith("action_items:") else l.strip() for l in text.split('\n') if l.strip()]
+                    doc_obj["deliverables"]["action_items"] = lines
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'document': doc_obj,
+                    'chunks': chunks
+                }
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG get-document API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents/<document_id>/toggle', methods=['POST'])
+    def rag_toggle_document(document_id):
+        """Toggle active status of a document."""
+        try:
+            data = request.get_json(silent=True) or {}
+            is_active = data.get('is_active', True)
+            adapter = VectorStoreAdapter()
+            res = adapter.toggle_document_active(document_id, is_active)
+            return jsonify({
+                'success': True,
+                'message': f"Document '{document_id}' active status set to {is_active}.",
+                'updated': res.get('updated', 0)
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG toggle-document API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents/<document_id>', methods=['DELETE'])
+    def rag_delete_document(document_id):
+        """Delete all chunks for a document."""
+        try:
+            adapter = VectorStoreAdapter()
+            res = adapter.delete_document(document_id)
+            return jsonify({
+                'success': True,
+                'message': f"Document '{document_id}' deleted successfully.",
+                'deleted': res.get('deleted', 0)
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG delete-document API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/chunks/<chunk_id>', methods=['PUT'])
+    def rag_update_chunk(chunk_id):
+        """Update a specific chunk text and/or quality score."""
+        try:
+            data = request.get_json(silent=True) or {}
+            new_text = data.get('text')
+            new_metadata = data.get('metadata', {})
+            if not new_text:
+                return jsonify({'error': 'text is required'}), 400
+            
+            adapter = VectorStoreAdapter()
+            res = adapter.update_chunk(chunk_id, new_text, new_metadata)
+            if not res.get('success'):
+                return jsonify({'error': res.get('error', 'Update failed')}), 400
+            
+            return jsonify({
+                'success': True,
+                'message': f"Chunk '{chunk_id}' updated successfully."
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG update-chunk API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents/<document_id>/evaluate', methods=['POST'])
+    def rag_evaluate_document(document_id):
+        """Evaluate document quality using LLM."""
+        try:
+            adapter = VectorStoreAdapter()
+            chunks = adapter.get_document_chunks(document_id)
+            if not chunks:
+                return jsonify({'error': f"Document '{document_id}' not found"}), 404
+            
+            doc_data = {
+                "document_id": document_id,
+                "chunks": [{"type": c.get("metadata", {}).get("chunk_type"), "text": c.get("text")} for c in chunks]
+            }
+            
+            prompt = prompt_builder.build_quality_evaluation_prompt(doc_data)
+            response_text = llm_service.generate_text(prompt)
+            
+            eval_data = parse_json_from_llm(response_text)
+            if "parsing_failed" in eval_data:
+                eval_data = {
+                    "score": 0.8,
+                    "findings": ["Không thể phân tích phản hồi JSON từ LLM."],
+                    "suggestions": [],
+                    "adjusted_quality_score": 0.8,
+                    "raw_response": response_text
+                }
+
+            return jsonify({
+                'success': True,
+                'evaluation': eval_data
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG evaluate-document API error: {e}")
             logger.error(traceback.format_exc())
             return jsonify({'error': str(e)}), 500
 

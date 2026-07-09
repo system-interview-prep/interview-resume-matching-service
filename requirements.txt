@@ -41,3 +41,7 @@ pgvector==0.2.5
 # Utilities
 gunicorn==22.0.0
 python-dotenv==1.0.1
+
+# AI Providers
+boto3>=1.28.0
+openai>=1.0.0

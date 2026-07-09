@@ -119,7 +119,8 @@ You must analyze:
 2. **Common Mistakes**: Check if the candidate fell into any of the common mistakes mentioned in the reference criteria.
 3. **Pillar Score**: Assign a quantitative score from 0.0 (completely incorrect/blank) to 1.0 (flawless response) based on completeness.
 
-CRITICAL RULE:
+CRITICAL RULES:
+- ZERO SCORE RULE: If the candidate's answer is completely empty, irrelevant, evasive (e.g., "I don't know", "same as you think", "cũng giống như bạn nghĩ", "like you think"), a joke, or does not contain any technical concepts relevant to the question, you MUST assign an "evaluation_score" of 0.0, put all criteria under "must_have_missed", and list the vague/irrelevant response under "mistakes_identified". Do NOT assign any partial credit (like 0.1 or 0.2) for such answers.
 - Do NOT copy the rubric or expected points verbatim in your assessment report.
 - Analyze the candidate's response in your own words. When discussing missing points, describe the concepts rather than repeating the reference phrases word-for-word.
 
@@ -216,9 +217,50 @@ Create structured feedback including:
 2. **Key Areas for Improvement**: Pinpoint specific technical concepts they missed or made mistakes on.
 3. **Actionable Next Steps (Deliverables)**: Provide clear, tailored learning recommendations or tasks aligned with the Reference Deliverables to help the candidate improve.
 
-CRITICAL RULE:
+CRITICAL RULES:
+- ZERO SCORE EXCEPTION: If the candidate's evaluation score is 0.0 or indicates a completely irrelevant/blank response, do NOT invent or list any "Strengths". Instead, state politely in the Strengths section that the candidate did not provide a relevant answer to evaluate, and focus entirely on the Areas for Improvement and Actionable Next Steps.
 - Do NOT copy the Reference Deliverables or reference answer guides verbatim.
 - Customize the recommendations so they are direct, practical, and written in your own words.
 
-Provide the feedback in a encouraging, professional tone.
+Provide the feedback in an encouraging, professional tone.
 """
+
+    def build_quality_evaluation_prompt(self, document_obj: Dict[str, Any]) -> str:
+        """Construct the prompt to evaluate the quality of an interview document.
+
+        Args:
+            document_obj: The complete dictionary representing the interview document.
+
+        Returns:
+            The formatted prompt string for LLM quality evaluation.
+        """
+        doc_str = json.dumps(document_obj, indent=2, ensure_ascii=False)
+        return f"""You are an expert technical QA engineer and RAG Knowledge Validator.
+Your job is to analyze the following interview preparation document and evaluate its structural quality, technical accuracy, clarity, and usefulness for RAG.
+
+[Document JSON Content]
+{doc_str}
+
+[Evaluation Criteria]
+1. **Technical Depth & Completeness**: Is the knowledge summary and concepts list technically deep, accurate, and comprehensive for the target topic and difficulty?
+2. **Actionability of Criteria**: Are the expected points (must_have) clear, concrete, and measurable during an interview?
+3. **Common Mistakes Relevance**: Are the typical candidate mistakes realistic and valuable for evaluation?
+4. **Follow-ups & Deliverables Alignment**: Are the follow-up questions and practical deliverables directly relevant, logically sound, and matched with the difficulty level?
+
+[Instructions]
+Perform a detailed assessment and output the result STRICTLY as a valid JSON object matching the following structure:
+{{
+  "score": 0.85, // Float between 0.0 and 1.0 representing the general quality score
+  "technical_depth_score": 0.90, // Float between 0.0 and 1.0
+  "criteria_clarity_score": 0.80, // Float between 0.0 and 1.0
+  "findings": [
+    "Short description of what is good or bad..."
+  ],
+  "suggestions": [
+    "Specific recommendations to improve this document..."
+  ],
+  "adjusted_quality_score": 0.85 // Recommended quality score for this RAG unit
+}}
+Do NOT include any markdown code blocks, backticks, or prefix/suffix text in your response. Output only the raw JSON.
+"""
+

@@ -100,7 +100,7 @@ class AlgorithmManager:
                         algorithm_config.setdefault('section_aware', True)
 
                     elif name == 'sbert':
-                        algorithm_config.setdefault('model_name', 'sentence-transformers/all-MiniLM-L6-v2')
+                        algorithm_config.setdefault('model_name', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
                         algorithm_config.setdefault('sbert_mode', True)
                         algorithm_config.setdefault('pooling', 'sentence')
                         algorithm_config.setdefault('section_aware', True)

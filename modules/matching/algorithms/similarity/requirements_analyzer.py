@@ -104,6 +104,8 @@ class RequirementsAnalyzer(BaseAlgorithm):
 
     def _canonicalize_item(self, item: str) -> str:
         normalized = self._normalize(item)
+        if len(item.split()) > 2 or ',' in item or ';' in item or len(item) > 20:
+            return item.strip()
         matched_terms = [term for term in sorted(self.skill_terms) if self._contains_term(normalized, term)]
         if len(matched_terms) == 1:
             return matched_terms[0]
@@ -122,12 +124,9 @@ class RequirementsAnalyzer(BaseAlgorithm):
         if self._contains_term(resume, item_norm):
             return 1.0, [item]
 
-        terms = self._terms_in_text(item_norm)
-        matched_terms = [term for term in terms if self._contains_term(resume, term)]
-        if terms:
-            return len(matched_terms) / len(terms), matched_terms
-
+        # 1) Try specific matching heuristics first
         heuristics = []
+        matched_terms = []
         if any(x in item_norm for x in ['team', 'manage', 'manager', 'lead', 'leadership']):
             leadership_terms = ['lead', 'leader', 'manager', 'manage', 'team', 'mentor', 'supervise']
             hit = [x for x in leadership_terms if self._contains_term(resume, x)]
@@ -143,9 +142,39 @@ class RequirementsAnalyzer(BaseAlgorithm):
             hit = [x for x in comm_terms if self._contains_term(resume, x)]
             heuristics.append(1.0 if hit else 0.0)
             matched_terms.extend(hit)
+        if 'gpa' in item_norm:
+            req_match = re.search(r'gpa\s*(?:of\s*|[:\-]?\s*)?(\d+(?:\.\d+)?)', item_norm)
+            candidate_match = re.search(r'gpa\s*[:\-]?\s*(\d+(?:\.\d+)?)', resume)
+            if req_match and candidate_match:
+                req_val = float(req_match.group(1))
+                cand_val = float(candidate_match.group(1))
+                if cand_val > 4.0 and req_val <= 4.0:
+                    cand_norm = cand_val * 4.0 / 10.0
+                elif cand_val <= 4.0 and req_val > 4.0:
+                    cand_norm = cand_val * 10.0 / 4.0
+                else:
+                    cand_norm = cand_val
+                
+                if cand_norm >= req_val:
+                    heuristics.append(1.0)
+                    matched_terms.append(f"gpa {cand_val}")
+                else:
+                    heuristics.append(0.0)
+        if any(x in item_norm for x in ['programming', 'coding', 'software development']):
+            prog_terms = ['java', 'python', 'javascript', 'typescript', 'c++', 'c#', 'go', 'rust', 'php']
+            hit = [x for x in prog_terms if self._contains_term(resume, x)]
+            if hit:
+                heuristics.append(1.0)
+                matched_terms.extend(hit)
 
         if heuristics:
             return max(heuristics), sorted(set(matched_terms))
+
+        # 2) Fallback to skill terms count if no heuristics matched
+        terms = self._terms_in_text(item_norm)
+        matched_terms = [term for term in terms if self._contains_term(resume, term)]
+        if terms:
+            return len(matched_terms) / len(terms), matched_terms
 
         return 0.0, []
 

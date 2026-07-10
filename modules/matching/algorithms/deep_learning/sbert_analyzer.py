@@ -11,7 +11,7 @@ class SBERTAnalyzer(BaseAlgorithm):
     
     def __init__(self, config: dict = None):
         super().__init__('sbert', config)
-        self.model_name = self.config.get('model_name', 'all-MiniLM-L6-v2')
+        self.model_name = self.config.get('model_name', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
         
     def load_model(self):
         """Load S-BERT model"""

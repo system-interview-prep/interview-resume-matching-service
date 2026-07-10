@@ -227,15 +227,26 @@ class RequirementsAnalyzer(BaseAlgorithm):
         matched = []
         missing = []
         partials = []
+        evidence = []
         for item in items:
             item_score, matched_terms = self._soft_item_score(resume, item)
             partials.append(item_score)
             if item_score >= 0.5:
                 matched.append(item if not matched_terms else f"{item} ({', '.join(matched_terms[:6])})")
+                evidence.append({
+                    'requirement': item,
+                    'status': 'matched',
+                    'snippets': matched_terms if matched_terms else [item]
+                })
             else:
                 missing.append(item)
+                evidence.append({
+                    'requirement': item,
+                    'status': 'missing',
+                    'snippets': []
+                })
         score = 1.0 if not items else sum(partials) / len(items)
-        return float(score), matched, missing
+        return float(score), matched, missing, evidence
 
     def process_single(self, resume_text: str, job_description: str, position: str = None) -> dict:
         if not self.is_loaded:
@@ -245,21 +256,37 @@ class RequirementsAnalyzer(BaseAlgorithm):
         nice_items = self._extract_items(job_description, 'nice')
         constraint_items = self._extract_items(job_description, 'constraints')
 
-        must_score, matched_must, missing_must = self._coverage(resume_text, must_items)
-        nice_score, matched_nice, missing_nice = self._coverage(resume_text, nice_items)
-        constraints_score, matched_constraints, missing_constraints = self._coverage(resume_text, constraint_items)
+        must_score, matched_must, missing_must, must_evidence = self._coverage(resume_text, must_items)
+        nice_score, matched_nice, missing_nice, nice_evidence = self._coverage(resume_text, nice_items)
+        constraints_score, matched_constraints, missing_constraints, constraints_evidence = self._coverage(resume_text, constraint_items)
 
         required_years = self._extract_year_requirement(job_description)
         resume_years = self._extract_resume_years(resume_text)
         experience_ok = required_years == 0 or resume_years >= required_years
         if required_years and not experience_ok:
+            year_req_item = f'{required_years}+ years experience'
             if resume_years > 0:
-                missing_must = missing_must + [f'{required_years}+ years experience']
+                missing_must = missing_must + [year_req_item]
                 must_score = must_score * 0.75
+                must_evidence.append({
+                    'requirement': year_req_item,
+                    'status': 'missing',
+                    'snippets': []
+                })
             else:
-                # Many resumes omit an explicit "X years" phrase even when experience exists.
-                # Treat unknown tenure as weak evidence, not a hard must-have miss.
                 must_score = must_score * 0.90
+                must_evidence.append({
+                    'requirement': year_req_item,
+                    'status': 'missing',
+                    'snippets': []
+                })
+        elif required_years and experience_ok:
+            year_req_item = f'{required_years}+ years experience'
+            must_evidence.append({
+                'requirement': year_req_item,
+                'status': 'matched',
+                'snippets': [f'{resume_years} years']
+            })
 
         total_weight = self.must_weight + self.nice_weight + self.constraints_weight
         score = (
@@ -293,6 +320,11 @@ class RequirementsAnalyzer(BaseAlgorithm):
                 'required_years_experience': required_years,
                 'resume_years_experience': resume_years,
                 'experience_ok': experience_ok,
+                'evidence': {
+                    'must_have': must_evidence,
+                    'nice_to_have': nice_evidence,
+                    'constraints': constraints_evidence
+                },
                 'weights': {
                     'must_have': self.must_weight,
                     'nice_to_have': self.nice_weight,

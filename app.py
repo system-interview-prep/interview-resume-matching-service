@@ -942,6 +942,88 @@ def create_app(config_name='default'):
             logger.error(f"RAG delete-document API error: {e}")
             return jsonify({'error': str(e)}), 500
 
+    @app.route('/api/v1/rag/documents/bulk-delete', methods=['POST'])
+    def rag_bulk_delete_documents():
+        """Delete all chunks for multiple documents in a single request."""
+        try:
+            data = request.get_json(silent=True) or {}
+            document_ids = data.get('document_ids', [])
+            if not document_ids or not isinstance(document_ids, list):
+                return jsonify({'error': 'document_ids must be a non-empty list'}), 400
+            
+            adapter = VectorStoreAdapter()
+            total_deleted = 0
+            if adapter.provider in {"postgresql", "postgres"}:
+                adapter.init_rag_table()
+                conn = adapter._get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM rag_knowledge_chunks WHERE document_id = ANY(%s);", (document_ids,))
+                    total_deleted = cur.rowcount
+                conn.commit()
+                conn.close()
+                success = True
+            else:
+                success = False
+                for doc_id in document_ids:
+                    res = adapter.delete_document(doc_id)
+                    total_deleted += res.get('deleted', 0)
+                    if res.get('success'):
+                        success = True
+                        
+            return jsonify({
+                'success': True,
+                'message': f"Deleted {len(document_ids)} documents successfully.",
+                'deleted': total_deleted
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG bulk delete-document API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/rag/documents/bulk-toggle', methods=['POST'])
+    def rag_bulk_toggle_documents():
+        """Toggle active status of multiple documents at once."""
+        try:
+            data = request.get_json(silent=True) or {}
+            document_ids = data.get('document_ids', [])
+            is_active = data.get('is_active')
+            if not document_ids or not isinstance(document_ids, list):
+                return jsonify({'error': 'document_ids must be a non-empty list'}), 400
+            if is_active is None:
+                return jsonify({'error': 'is_active is required'}), 400
+            
+            adapter = VectorStoreAdapter()
+            total_updated = 0
+            if adapter.provider in {"postgresql", "postgres"}:
+                adapter.init_rag_table()
+                conn = adapter._get_db_connection()
+                with conn.cursor() as cur:
+                    active_str = "true" if is_active else "false"
+                    cur.execute(f"""
+                        UPDATE rag_knowledge_chunks
+                        SET metadata = jsonb_set(metadata, '{{is_active}}', %s::jsonb)
+                        WHERE document_id = ANY(%s);
+                    """, (active_str, document_ids))
+                    total_updated = cur.rowcount
+                conn.commit()
+                conn.close()
+                success = True
+            else:
+                success = False
+                for doc_id in document_ids:
+                    res = adapter.toggle_document_active(doc_id, is_active)
+                    total_updated += res.get('updated', 0)
+                    if res.get('success'):
+                        success = True
+            
+            return jsonify({
+                'success': True,
+                'message': f"Updated {len(document_ids)} documents successfully.",
+                'updated': total_updated
+            }), 200
+        except Exception as e:
+            logger.error(f"RAG bulk toggle-document API error: {e}")
+            return jsonify({'error': str(e)}), 500
+
     @app.route('/api/v1/rag/chunks/<chunk_id>', methods=['PUT'])
     def rag_update_chunk(chunk_id):
         """Update a specific chunk text and/or quality score."""

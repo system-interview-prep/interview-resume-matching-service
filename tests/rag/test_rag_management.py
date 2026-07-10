@@ -208,8 +208,67 @@ class TestRAGManagement(unittest.TestCase):
         response = self.client.delete('/api/v1/rag/documents/test_mgt_doc_temp')
         self.assertEqual(response.status_code, 200)
 
-        # Verify it is deleted
-        response = self.client.get('/api/v1/rag/documents/test_mgt_doc_temp')
+    def test_bulk_toggle_documents(self):
+        """Test bulk active status toggling for multiple documents."""
+        # 1. Turn active off for both doc1 and doc2
+        response = self.client.post('/api/v1/rag/documents/bulk-toggle',
+                                    data=json.dumps({
+                                        "document_ids": ["test_mgt_doc_01", "test_mgt_doc_02"],
+                                        "is_active": False
+                                    }),
+                                    content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        
+        # Verify both are inactive
+        response = self.client.get('/api/v1/rag/documents/test_mgt_doc_01')
+        res_data = json.loads(response.data.decode('utf-8'))
+        self.assertFalse(res_data['data']['document']['metadata']['retrieval']['is_active'])
+
+        response = self.client.get('/api/v1/rag/documents/test_mgt_doc_02')
+        res_data = json.loads(response.data.decode('utf-8'))
+        self.assertFalse(res_data['data']['document']['metadata']['retrieval']['is_active'])
+
+        # 2. Turn them back on
+        response = self.client.post('/api/v1/rag/documents/bulk-toggle',
+                                    data=json.dumps({
+                                        "document_ids": ["test_mgt_doc_01", "test_mgt_doc_02"],
+                                        "is_active": True
+                                    }),
+                                    content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+
+    def test_bulk_delete_documents(self):
+        """Test bulk document deletion."""
+        # Seed temp docs
+        doc_a = dict(self.doc1)
+        doc_a['document'] = dict(doc_a['document'])
+        doc_a['document']['document_id'] = 'test_bulk_a'
+        
+        doc_b = dict(self.doc1)
+        doc_b['document'] = dict(doc_b['document'])
+        doc_b['document']['document_id'] = 'test_bulk_b'
+
+        self.client.post('/api/v1/rag/upsert-document', data=json.dumps(doc_a), content_type='application/json')
+        self.client.post('/api/v1/rag/upsert-document', data=json.dumps(doc_b), content_type='application/json')
+
+        # Verify they exist
+        response = self.client.get('/api/v1/rag/documents/test_bulk_a')
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get('/api/v1/rag/documents/test_bulk_b')
+        self.assertEqual(response.status_code, 200)
+
+        # Bulk delete
+        response = self.client.post('/api/v1/rag/documents/bulk-delete',
+                                    data=json.dumps({
+                                        "document_ids": ["test_bulk_a", "test_bulk_b"]
+                                    }),
+                                    content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+
+        # Verify they are deleted
+        response = self.client.get('/api/v1/rag/documents/test_bulk_a')
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get('/api/v1/rag/documents/test_bulk_b')
         self.assertEqual(response.status_code, 404)
 
 if __name__ == '__main__':

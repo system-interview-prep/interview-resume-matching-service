@@ -76,17 +76,45 @@ class BERTAnalyzer(BaseAlgorithm):
             except Exception as e:
                 logger.warning(f"Failed to save BERT embedding to database cache: {e}")
 
+    def _get_cv_embedding(self, cv_text: str, cv_id: str = None) -> np.ndarray:
+        """Retrieve CV embedding using pgvector database cache with checksum and version verification for BERT."""
+        import hashlib
+        checksum = hashlib.sha256(cv_text.encode('utf-8')).hexdigest()
+
+        vector_db = getattr(self, 'vector_db', None)
+        if cv_id and vector_db:
+            try:
+                cache = vector_db.get_cv_cache(cv_id)
+                if cache and cache.get('checksum') == checksum:
+                    db_vector = cache.get('bert')
+                    if db_vector is not None:
+                        logger.info(f"BERT Cache Hit (DB): CV embedding retrieved from pgvector (version={cache.get('version')})")
+                        return np.array([db_vector])  # shape (1, 768)
+            except Exception as e:
+                logger.warning(f"Failed to fetch BERT CV vector from database cache: {e}")
+
+        # Cache miss: Compute BERT CLS token embedding
+        logger.info("BERT Cache Miss: Encoding CV text using model")
+        embedding = self._get_embeddings(cv_text)  # shape (1, 768)
+
+        # Save to Database Cache
+        if cv_id and vector_db:
+            try:
+                vector_db.upsert_cv_cache(cv_id, checksum, 'bert', embedding[0].tolist())
+            except Exception as e:
+                logger.warning(f"Failed to save BERT CV embedding to database cache: {e}")
+
         return embedding
 
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, job_id: str = None) -> dict:
+                      position: str = None, job_id: str = None, cv_id: str = None) -> dict:
         """Process single resume with BERT (utilizing caching)"""
         if not self.is_loaded:
             self.load_model()
         
         try:
             # Get embeddings
-            resume_embedding = self._get_embeddings(resume_text)
+            resume_embedding = self._get_cv_embedding(resume_text, cv_id)
             job_embedding = self._get_jd_embedding(job_description, job_id)
             
             # Calculate similarity
@@ -109,7 +137,7 @@ class BERTAnalyzer(BaseAlgorithm):
             raise
 
     def process_batch(self, resume_texts: list, job_description: str, 
-                     position: str = None, job_id: str = None) -> list:
+                      position: str = None, job_id: str = None, cv_id: str = None) -> list:
         """Process multiple resumes in batch using JD embedding cache."""
         if not self.is_loaded:
             self.load_model()
@@ -124,7 +152,10 @@ class BERTAnalyzer(BaseAlgorithm):
             # 2. Process each resume
             for i, resume_text in enumerate(resume_texts):
                 try:
-                    resume_embedding = self._get_embeddings(resume_text)
+                    if cv_id and len(resume_texts) == 1:
+                        resume_embedding = self._get_cv_embedding(resume_text, cv_id)
+                    else:
+                        resume_embedding = self._get_embeddings(resume_text)
                     similarity_score = cosine_similarity(resume_embedding, job_embedding)[0][0]
                     normalized_score = max(0, min(1, (similarity_score + 1) / 2))
 

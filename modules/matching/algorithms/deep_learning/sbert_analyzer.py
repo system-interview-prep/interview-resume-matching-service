@@ -3,6 +3,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from ..base_algorithm import BaseAlgorithm
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,38 @@ class SBERTAnalyzer(BaseAlgorithm):
             except Exception as e:
                 logger.warning(f"Failed to save sBERT embedding to database cache: {e}")
 
+    def _get_cv_embedding(self, cv_text: str, cv_id: str = None) -> np.ndarray:
+        """Retrieve CV embedding using pgvector database cache with checksum and version verification for sBERT."""
+        import hashlib
+        checksum = hashlib.sha256(cv_text.encode('utf-8')).hexdigest()
+
+        vector_db = getattr(self, 'vector_db', None)
+        if cv_id and vector_db:
+            try:
+                cache = vector_db.get_cv_cache(cv_id)
+                if cache and cache.get('checksum') == checksum:
+                    db_vector = cache.get('sbert')
+                    if db_vector is not None:
+                        logger.info(f"SBERT Cache Hit (DB): CV embedding retrieved from pgvector (version={cache.get('version')})")
+                        return np.array(db_vector)
+            except Exception as e:
+                logger.warning(f"Failed to fetch sBERT CV vector from database cache: {e}")
+
+        # Cache miss: Encode CV text
+        logger.info("SBERT Cache Miss: Encoding CV text using model")
+        embedding = self.model.encode([cv_text], convert_to_tensor=False)[0]
+
+        # Save to Database Cache
+        if cv_id and vector_db:
+            try:
+                vector_db.upsert_cv_cache(cv_id, checksum, 'sbert', embedding.tolist())
+            except Exception as e:
+                logger.warning(f"Failed to save sBERT CV embedding to database cache: {e}")
+
         return embedding
 
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, job_id: str = None) -> dict:
+                      position: str = None, job_id: str = None, cv_id: str = None) -> dict:
         """Process single resume with S-BERT (utilizing caching)"""
         if not self.is_loaded:
             self.load_model()
@@ -63,7 +92,7 @@ class SBERTAnalyzer(BaseAlgorithm):
         try:
             # Get embeddings
             job_embedding = self._get_jd_embedding(job_description, job_id)
-            resume_embedding = self.model.encode([resume_text], convert_to_tensor=False)[0]
+            resume_embedding = self._get_cv_embedding(resume_text, cv_id)
             
             # Calculate cosine similarity
             similarity_score = cosine_similarity([resume_embedding], [job_embedding])[0][0]
@@ -86,7 +115,7 @@ class SBERTAnalyzer(BaseAlgorithm):
             raise
 
     def process_batch(self, resume_texts: list, job_description: str, 
-                     position: str = None, job_id: str = None) -> list:
+                      position: str = None, job_id: str = None, cv_id: str = None) -> list:
         """Process multiple resumes in batch using optimal batch encoding and JD vector caching."""
         if not self.is_loaded:
             self.load_model()
@@ -98,9 +127,12 @@ class SBERTAnalyzer(BaseAlgorithm):
             # 1. Retrieve JD embedding (with L1/L2 cache)
             job_embedding = self._get_jd_embedding(job_description, job_id)
 
-            # 2. Encode all resumes in one batch
-            logger.info(f"SBERT: Batch encoding {len(resume_texts)} resumes")
-            resume_embeddings = self.model.encode(resume_texts, convert_to_tensor=False)
+            # 2. Encode or fetch CV embedding
+            if cv_id and len(resume_texts) == 1:
+                resume_embeddings = [self._get_cv_embedding(resume_texts[0], cv_id)]
+            else:
+                logger.info(f"SBERT: Batch encoding {len(resume_texts)} resumes")
+                resume_embeddings = self.model.encode(resume_texts, convert_to_tensor=False)
 
             # 3. Calculate similarity for each resume
             for i, r_emb in enumerate(resume_embeddings):

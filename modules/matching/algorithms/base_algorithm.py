@@ -27,16 +27,16 @@ class BaseAlgorithm(ABC):
     
     @abstractmethod
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, **kwargs) -> Dict[str, Any]:
-        """Process a single resume and return score with details"""
-        pass
-    
-    def process_batch(self, resume_texts: List[str], job_description: str, 
-                     position: str = None, job_id: str = None) -> List[Dict[str, Any]]:
-        """Process multiple resumes in batch"""
+                       position: str = None, job_id: str = None, cv_id: str = None) -> dict:
+        """Process a single resume against a job description"""
+        raise NotImplementedError("Each algorithm must implement process_single")
+
+    def process_batch(self, resume_texts: list, job_description: str, 
+                      position: str = None, job_id: str = None, cv_id: str = None) -> list:
+        """Process multiple resumes in batch, utilizing any algorithm-level optimizations."""
         if not self.is_loaded:
             self.load_model()
-        
+            
         results = []
         start_time = time.time()
         
@@ -45,10 +45,12 @@ class BaseAlgorithm(ABC):
                 try:
                     import inspect
                     sig = inspect.signature(self.process_single)
+                    kwargs = {}
                     if 'job_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                        result = self.process_single(resume_text, job_description, position, job_id=job_id)
-                    else:
-                        result = self.process_single(resume_text, job_description, position)
+                        kwargs['job_id'] = job_id
+                    if 'cv_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        kwargs['cv_id'] = cv_id
+                    result = self.process_single(resume_text, job_description, position, **kwargs)
                     result['resume_index'] = i
                     results.append(result)
                     self._performance_metrics['total_processed'] += 1

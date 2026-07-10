@@ -120,6 +120,7 @@ def create_app(config_name='default'):
         if db_url:
             vector_db = VectorDB(db_url, vec_dim)
             vector_db.init_tables()
+            vector_db.init_cv_table()
             algorithm_manager.vector_db = vector_db
             logger.info("Vector database initialized successfully")
     except Exception as e:
@@ -402,6 +403,88 @@ def create_app(config_name='default'):
             return jsonify({'success': True, 'job_id': job_id, 'message': 'JD vector deleted'}), 200
         except Exception as e:
             logger.error(f"JD delete error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/cv/vectorize', methods=['POST'])
+    def vectorize_cv():
+        """Pre-compute and store CV embedding in PostgreSQL pgvector.
+        
+        Body: { "cv_id": "...", "cv_text": "..." }
+        """
+        if not vector_db:
+            return jsonify({'error': 'Vector database is not configured'}), 503
+
+        data = request.get_json(silent=True) or {}
+        cv_id = str(data.get('cv_id', '')).strip()
+        cv_text = str(data.get('cv_text', '')).strip()
+
+        if not cv_id:
+            return jsonify({'error': 'cv_id is required'}), 400
+        if not cv_text:
+            return jsonify({'error': 'cv_text is required'}), 400
+
+        try:
+            # Ensure semantic models are loaded
+            models_to_load = []
+            for m in ['sbert', 'bert', 'distilbert']:
+                if m in algorithm_manager.algorithm_registry:
+                    models_to_load.append(m)
+
+            algorithm_manager.initialize_algorithms(models_to_load)
+
+            import hashlib
+            checksum = hashlib.sha256(cv_text.encode('utf-8')).hexdigest()
+
+            # Encode and upsert for each active model
+            # sBERT
+            sbert_alg = algorithm_manager.algorithms.get('sbert')
+            if sbert_alg and hasattr(sbert_alg, 'model'):
+                sbert_vector = sbert_alg.model.encode([cv_text])[0].tolist()
+                vector_db.upsert_cv_cache(cv_id, checksum, 'sbert', sbert_vector, cv_text=cv_text)
+
+            # BERT
+            bert_alg = algorithm_manager.algorithms.get('bert')
+            if bert_alg and hasattr(bert_alg, '_get_embeddings'):
+                bert_vector = bert_alg._get_embeddings(cv_text)[0].tolist()
+                vector_db.upsert_cv_cache(cv_id, checksum, 'bert', bert_vector, cv_text=cv_text)
+
+            # DistilBERT
+            distilbert_alg = algorithm_manager.algorithms.get('distilbert')
+            if distilbert_alg and hasattr(distilbert_alg, '_embed'):
+                cleaned = distilbert_alg._clean(cv_text)
+                distilbert_vector = distilbert_alg._embed(cleaned)[0].tolist()
+                vector_db.upsert_cv_cache(cv_id, checksum, 'distilbert', distilbert_vector, cv_text=cv_text)
+
+            return jsonify({
+                'success': True,
+                'cv_id': cv_id,
+                'message': 'CV vectorized and stored successfully across semantic models'
+            }), 200
+
+        except Exception as e:
+            logger.error(f"CV vectorize error: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/v1/cv/delete', methods=['POST'])
+    def delete_cv_vector():
+        """Delete a stored CV vector embedding.
+        
+        Body: { "cv_id": "..." }
+        """
+        if not vector_db:
+            return jsonify({'error': 'Vector database is not configured'}), 503
+
+        data = request.get_json(silent=True) or {}
+        cv_id = str(data.get('cv_id', '')).strip()
+        if not cv_id:
+            return jsonify({'error': 'cv_id is required'}), 400
+
+        try:
+            vector_db.delete_cv_vector(cv_id)
+            return jsonify({'success': True, 'cv_id': cv_id, 'message': 'CV vector deleted'}), 200
+        except Exception as e:
+            logger.error(f"CV delete error: {e}")
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/v1/match', methods=['POST'])
@@ -1121,6 +1204,7 @@ def create_app(config_name='default'):
             failed_files = []
             resume_texts = []
             job_id = None
+            cv_id = None
 
             if request.is_json:
                 payload = request.get_json(silent=True) or {}
@@ -1133,6 +1217,7 @@ def create_app(config_name='default'):
                 options = payload.get('options') if isinstance(payload.get('options'), dict) else {}
                 metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
                 job_id = metadata.get('jobId') or metadata.get('job_id') or payload.get('job_id')
+                cv_id = metadata.get('candidateId') or metadata.get('candidate_id') or metadata.get('cv_id') or payload.get('candidate_id') or payload.get('cv_id')
 
                 if not job_id:
                     return jsonify({'error': 'job_id is required in metadata or request payload'}), 400
@@ -1205,6 +1290,7 @@ def create_app(config_name='default'):
                 except json.JSONDecodeError:
                     metadata = {}
                 job_id = metadata.get('jobId') or metadata.get('job_id')
+                cv_id = metadata.get('candidateId') or metadata.get('candidate_id') or metadata.get('cv_id')
 
                 if not job_id:
                     return jsonify({'error': 'job_id is required in metadata form field'}), 400
@@ -1236,7 +1322,7 @@ def create_app(config_name='default'):
                 resume_texts = [f['text'] for f in successful_files]
             
             algorithm_results = algorithm_manager.process_resumes_parallel(
-                resume_texts, job_description, methods, position, job_id=job_id
+                resume_texts, job_description, methods, position, job_id=job_id, cv_id=cv_id
             )
             
             # Calculate processing time

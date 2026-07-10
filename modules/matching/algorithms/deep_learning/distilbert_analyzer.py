@@ -85,10 +85,39 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             except Exception as e:
                 logger.warning(f"Failed to save DistilBERT embedding to database cache: {e}")
 
+    def _get_cv_embedding(self, cv_text: str, cv_id: str = None) -> np.ndarray:
+        """Retrieve CV embedding using pgvector database cache with checksum and version verification for DistilBERT."""
+        import hashlib
+        checksum = hashlib.sha256(cv_text.encode('utf-8')).hexdigest()
+
+        vector_db = getattr(self, 'vector_db', None)
+        if cv_id and vector_db:
+            try:
+                cache = vector_db.get_cv_cache(cv_id)
+                if cache and cache.get('checksum') == checksum:
+                    db_vector = cache.get('distilbert')
+                    if db_vector is not None:
+                        logger.info(f"DistilBERT Cache Hit (DB): CV embedding retrieved from pgvector (version={cache.get('version')})")
+                        return np.array([db_vector])  # shape (1, 768)
+            except Exception as e:
+                logger.warning(f"Failed to fetch DistilBERT CV vector from database cache: {e}")
+
+        # Cache miss: Compute DistilBERT embedding
+        logger.info("DistilBERT Cache Miss: Encoding clean CV text using model")
+        r_clean = self._clean(cv_text)
+        embedding = self._embed(r_clean)  # shape (1, 768)
+
+        # Save to Database Cache
+        if cv_id and vector_db:
+            try:
+                vector_db.upsert_cv_cache(cv_id, checksum, 'distilbert', embedding[0].tolist())
+            except Exception as e:
+                logger.warning(f"Failed to save DistilBERT CV embedding to database cache: {e}")
+
         return embedding
 
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, job_id: str = None) -> dict:
+                      position: str = None, job_id: str = None, cv_id: str = None) -> dict:
         """INTELLIGENT multi-metric scoring with penalties"""
         if not self.is_loaded:
             self.load_model()
@@ -101,7 +130,7 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             j_clean = self._clean(job_description)
             
             # === METRIC 1: BERT Semantic Similarity (baseline) ===
-            r_emb = self._embed(r_clean)
+            r_emb = self._get_cv_embedding(resume_text, cv_id)
             j_emb = self._get_jd_embedding(job_description, job_id)
             bert_sim = float(cosine_similarity(r_emb, j_emb)[0][0])
             

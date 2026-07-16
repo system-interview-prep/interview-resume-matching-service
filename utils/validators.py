@@ -1,6 +1,6 @@
 from typing import Dict, List, Any
 import re
-from flask import Request
+Request = Any
 import logging
 
 logger = logging.getLogger(__name__)

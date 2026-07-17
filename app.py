@@ -4,11 +4,8 @@ import ssl
 try:
     import requests
     from requests.adapters import HTTPAdapter
-    old_send = HTTPAdapter.send
-    def new_send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
-        return old_send(self, request, stream=stream, timeout=timeout, verify=False, cert=cert, proxies=proxies)
-    HTTPAdapter.send = new_send
-    
+    # NOTE: Do not disable TLS verification globally. If you need a custom CA bundle,
+    # configure REQUESTS_CA_BUNDLE / SSL_CERT_FILE instead.
     from huggingface_hub import configure_http_backend
     def backend_factory() -> requests.Session:
         session = requests.Session()

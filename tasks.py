@@ -2,8 +2,6 @@ import os
 import logging
 import hashlib
 import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
 try:
     import requests
     from requests.adapters import HTTPAdapter

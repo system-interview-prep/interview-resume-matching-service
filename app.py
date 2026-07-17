@@ -52,6 +52,10 @@ class FlaskFileMock:
         self.fastapi_file = fastapi_file
         self.filename = fastapi_file.filename
 
+    @property
+    def stream(self):
+        return self
+
     def seek(self, offset, whence=0):
         return self.fastapi_file.file.seek(offset, whence)
 
@@ -1061,7 +1065,7 @@ def create_app(config_name='default'):
                 'message': f'Imported {len(imported_docs)} documents successfully from CSV.',
                 'imported_document_ids': imported_docs,
                 'failed_rows': failed_rows
-            }), 200
+            })
 
         except Exception as e:
             logger.error(f"RAG import-csv API error: {e}")
@@ -1085,7 +1089,7 @@ def create_app(config_name='default'):
                 'success': True,
                 'message': f"Document '{doc_id}' upserted successfully.",
                 'records': res.get('records', 0)
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG upsert-document API error: {e}")
             logger.error(traceback.format_exc())
@@ -1098,10 +1102,12 @@ def create_app(config_name='default'):
         try:
             adapter = VectorStoreAdapter()
             docs = adapter.get_all_documents()
-            return jsonify({
+            response = jsonify({
                 'success': True,
                 'data': docs
-            }), 200
+            })
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return response
         except Exception as e:
             logger.error(f"RAG list-documents API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1209,7 +1215,7 @@ def create_app(config_name='default'):
                     'document': doc_obj,
                     'chunks': chunks
                 }
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG get-document API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1227,7 +1233,7 @@ def create_app(config_name='default'):
                 'success': True,
                 'message': f"Document '{document_id}' active status set to {is_active}.",
                 'updated': res.get('updated', 0)
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG toggle-document API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1243,7 +1249,7 @@ def create_app(config_name='default'):
                 'success': True,
                 'message': f"Document '{document_id}' deleted successfully.",
                 'deleted': res.get('deleted', 0)
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG delete-document API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1281,7 +1287,7 @@ def create_app(config_name='default'):
                 'success': True,
                 'message': f"Deleted {len(document_ids)} documents successfully.",
                 'deleted': total_deleted
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG bulk delete-document API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1327,7 +1333,7 @@ def create_app(config_name='default'):
                 'success': True,
                 'message': f"Updated {len(document_ids)} documents successfully.",
                 'updated': total_updated
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG bulk toggle-document API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1351,7 +1357,7 @@ def create_app(config_name='default'):
             return jsonify({
                 'success': True,
                 'message': f"Chunk '{chunk_id}' updated successfully."
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG update-chunk API error: {e}")
             return jsonify({'error': str(e)}), 500
@@ -1387,7 +1393,7 @@ def create_app(config_name='default'):
             return jsonify({
                 'success': True,
                 'evaluation': eval_data
-            }), 200
+            })
         except Exception as e:
             logger.error(f"RAG evaluate-document API error: {e}")
             logger.error(traceback.format_exc())

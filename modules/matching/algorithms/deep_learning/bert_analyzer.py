@@ -107,7 +107,8 @@ class BERTAnalyzer(BaseAlgorithm):
         return embedding
 
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, job_id: str = None, cv_id: str = None) -> dict:
+                      position: str = None, job_id: str = None, cv_id: str = None,
+                      chunk_level: bool = True) -> dict:
         """Process single resume with BERT (utilizing caching)"""
         if not self.is_loaded:
             self.load_model()

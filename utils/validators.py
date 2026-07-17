@@ -16,7 +16,7 @@ class RequestValidator:
         
         # Valid algorithms
         self.valid_algorithms = {
-            'bert', 'distilbert', 'sbert',
+            'bert', 'distilbert', 'sbert', 'cross_encoder',
             'cosine', 'jaccard', 'bm25', 'requirements', 'must_have', 'ner',
         }
         

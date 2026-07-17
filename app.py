@@ -1,5 +1,28 @@
 """CV–JD scoring service API (multi-criteria fusion). Academic/train endpoints removed."""
 
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    old_send = HTTPAdapter.send
+    def new_send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        return old_send(self, request, stream=stream, timeout=timeout, verify=False, cert=cert, proxies=proxies)
+    HTTPAdapter.send = new_send
+    
+    from huggingface_hub import configure_http_backend
+    def backend_factory() -> requests.Session:
+        session = requests.Session()
+        session.verify = False
+        return session
+    configure_http_backend(backend_factory=backend_factory)
+    
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1535,7 +1558,7 @@ def create_app(config_name='default'):
                 resume_texts = [f['text'] for f in successful_files]
             
             algorithm_results = algorithm_manager.process_resumes_parallel(
-                resume_texts, job_description, methods, position, job_id=job_id, cv_id=cv_id
+                resume_texts, job_description, methods, position, job_id=job_id, cv_id=cv_id, options=options
             )
             
             # Calculate processing time

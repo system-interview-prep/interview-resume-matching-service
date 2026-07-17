@@ -36,3 +36,5 @@ build/
 
 # VSCode settings
 .vscode/
+.pyc
+__pycache__/

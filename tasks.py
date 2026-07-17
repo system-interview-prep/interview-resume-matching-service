@@ -1,6 +1,28 @@
 import os
 import logging
 import hashlib
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    old_send = HTTPAdapter.send
+    def new_send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        return old_send(self, request, stream=stream, timeout=timeout, verify=False, cert=cert, proxies=proxies)
+    HTTPAdapter.send = new_send
+    
+    from huggingface_hub import configure_http_backend
+    def backend_factory() -> requests.Session:
+        session = requests.Session()
+        session.verify = False
+        return session
+    configure_http_backend(backend_factory=backend_factory)
+    
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
 from celery import Celery
 from config.settings import config_dict
 from modules.matching.manager import AlgorithmManager
@@ -70,21 +92,21 @@ def vectorize_jd_task(job_id: str, job_text: str):
 
         # sBERT
         sbert_alg = algorithm_manager.algorithms.get('sbert')
-        if sbert_alg and hasattr(sbert_alg, 'model'):
+        if sbert_alg and getattr(sbert_alg, 'is_loaded', False) and getattr(sbert_alg, 'model', None) is not None:
             sbert_vector = sbert_alg.model.encode([job_text])[0].tolist()
             vector_db.upsert_jd_cache(job_id, checksum, 'sbert', sbert_vector, job_text=job_text)
             logger.info(f"sBERT vector computed & stored for job_id={job_id}")
 
         # BERT
         bert_alg = algorithm_manager.algorithms.get('bert')
-        if bert_alg and hasattr(bert_alg, '_get_embeddings'):
+        if bert_alg and getattr(bert_alg, 'is_loaded', False):
             bert_vector = bert_alg._get_embeddings(job_text)[0].tolist()
             vector_db.upsert_jd_cache(job_id, checksum, 'bert', bert_vector, job_text=job_text)
             logger.info(f"BERT vector computed & stored for job_id={job_id}")
 
         # DistilBERT
         distilbert_alg = algorithm_manager.algorithms.get('distilbert')
-        if distilbert_alg and hasattr(distilbert_alg, '_embed'):
+        if distilbert_alg and getattr(distilbert_alg, 'is_loaded', False):
             cleaned = distilbert_alg._clean(job_text)
             distilbert_vector = distilbert_alg._embed(cleaned)[0].tolist()
             vector_db.upsert_jd_cache(job_id, checksum, 'distilbert', distilbert_vector, job_text=job_text)
@@ -111,21 +133,21 @@ def vectorize_cv_task(cv_id: str, cv_text: str):
 
         # sBERT
         sbert_alg = algorithm_manager.algorithms.get('sbert')
-        if sbert_alg and hasattr(sbert_alg, 'model'):
+        if sbert_alg and getattr(sbert_alg, 'is_loaded', False) and getattr(sbert_alg, 'model', None) is not None:
             sbert_vector = sbert_alg.model.encode([cv_text])[0].tolist()
             vector_db.upsert_cv_cache(cv_id, checksum, 'sbert', sbert_vector, cv_text=cv_text)
             logger.info(f"sBERT vector computed & stored for cv_id={cv_id}")
 
         # BERT
         bert_alg = algorithm_manager.algorithms.get('bert')
-        if bert_alg and hasattr(bert_alg, '_get_embeddings'):
+        if bert_alg and getattr(bert_alg, 'is_loaded', False):
             bert_vector = bert_alg._get_embeddings(cv_text)[0].tolist()
             vector_db.upsert_cv_cache(cv_id, checksum, 'bert', bert_vector, cv_text=cv_text)
             logger.info(f"BERT vector computed & stored for cv_id={cv_id}")
 
         # DistilBERT
         distilbert_alg = algorithm_manager.algorithms.get('distilbert')
-        if distilbert_alg and hasattr(distilbert_alg, '_embed'):
+        if distilbert_alg and getattr(distilbert_alg, 'is_loaded', False):
             cleaned = distilbert_alg._clean(cv_text)
             distilbert_vector = distilbert_alg._embed(cleaned)[0].tolist()
             vector_db.upsert_cv_cache(cv_id, checksum, 'distilbert', distilbert_vector, cv_text=cv_text)

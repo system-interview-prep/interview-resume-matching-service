@@ -85,10 +85,40 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             except Exception as e:
                 logger.warning(f"Failed to save DistilBERT embedding to database cache: {e}")
 
+    def _get_cv_embedding(self, cv_text: str, cv_id: str = None) -> np.ndarray:
+        """Retrieve CV embedding using pgvector database cache with checksum and version verification for DistilBERT."""
+        import hashlib
+        checksum = hashlib.sha256(cv_text.encode('utf-8')).hexdigest()
+
+        vector_db = getattr(self, 'vector_db', None)
+        if cv_id and vector_db:
+            try:
+                cache = vector_db.get_cv_cache(cv_id)
+                if cache and cache.get('checksum') == checksum:
+                    db_vector = cache.get('distilbert')
+                    if db_vector is not None:
+                        logger.info(f"DistilBERT Cache Hit (DB): CV embedding retrieved from pgvector (version={cache.get('version')})")
+                        return np.array([db_vector])  # shape (1, 768)
+            except Exception as e:
+                logger.warning(f"Failed to fetch DistilBERT CV vector from database cache: {e}")
+
+        # Cache miss: Compute DistilBERT embedding
+        logger.info("DistilBERT Cache Miss: Encoding clean CV text using model")
+        r_clean = self._clean(cv_text)
+        embedding = self._embed(r_clean)  # shape (1, 768)
+
+        # Save to Database Cache
+        if cv_id and vector_db:
+            try:
+                vector_db.upsert_cv_cache(cv_id, checksum, 'distilbert', embedding[0].tolist())
+            except Exception as e:
+                logger.warning(f"Failed to save DistilBERT CV embedding to database cache: {e}")
+
         return embedding
 
     def process_single(self, resume_text: str, job_description: str, 
-                      position: str = None, job_id: str = None) -> dict:
+                      position: str = None, job_id: str = None, cv_id: str = None,
+                      chunk_level: bool = True) -> dict:
         """INTELLIGENT multi-metric scoring with penalties"""
         if not self.is_loaded:
             self.load_model()
@@ -100,10 +130,25 @@ class DistilBERTAnalyzer(BaseAlgorithm):
             r_clean = self._clean(resume_text)
             j_clean = self._clean(job_description)
             
-            # === METRIC 1: BERT Semantic Similarity (baseline) ===
-            r_emb = self._embed(r_clean)
-            j_emb = self._get_jd_embedding(job_description, job_id)
-            bert_sim = float(cosine_similarity(r_emb, j_emb)[0][0])
+            # === METRIC 1: BERT Semantic Similarity (baseline, supports Chunk-level) ===
+            if chunk_level:
+                from utils.text_chunker import get_chunks
+                cv_chunks = get_chunks(resume_text, chunk_size=100, overlap=20)
+                jd_chunks = get_chunks(job_description, chunk_size=100, overlap=20)
+                
+                if cv_chunks and jd_chunks:
+                    cv_embeddings = np.concatenate([self._embed(self._clean(chunk)) for chunk in cv_chunks], axis=0)
+                    jd_embeddings = np.concatenate([self._embed(self._clean(chunk)) for chunk in jd_chunks], axis=0)
+                    
+                    sim_matrix = cosine_similarity(cv_embeddings, jd_embeddings)
+                    max_sims = np.max(sim_matrix, axis=0)
+                    bert_sim = float(np.mean(max_sims))
+                else:
+                    bert_sim = 0.0
+            else:
+                r_emb = self._get_cv_embedding(resume_text, cv_id)
+                j_emb = self._get_jd_embedding(job_description, job_id)
+                bert_sim = float(cosine_similarity(r_emb, j_emb)[0][0])
             
             # Normalize BERT score (it's naturally 0.85-0.99, map to 0.3-0.9)
             bert_normalized = max(0.0, min(1.0, (bert_sim - 0.85) / 0.14))  # Maps 0.85-0.99 to 0-1

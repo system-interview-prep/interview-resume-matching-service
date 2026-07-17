@@ -19,6 +19,11 @@ try:
 except ImportError:
     SBERTAnalyzer = None
 
+try:
+    from modules.matching.algorithms.deep_learning.cross_encoder_analyzer import CrossEncoderAnalyzer
+except ImportError:
+    CrossEncoderAnalyzer = None
+
 # Similarity analyzers
 from modules.matching.algorithms.similarity.cosine_similarity import CosineSimilarityAnalyzer
 try:
@@ -59,6 +64,8 @@ class AlgorithmManager:
             registry['sbert'] = SBERTAnalyzer
         elif BERTAnalyzer:
             registry['sbert'] = BERTAnalyzer  # Will pass sbert/miniLM config
+        if CrossEncoderAnalyzer:
+            registry['cross_encoder'] = CrossEncoderAnalyzer
 
         # Similarity models
         registry['cosine'] = CosineSimilarityAnalyzer
@@ -100,7 +107,7 @@ class AlgorithmManager:
                         algorithm_config.setdefault('section_aware', True)
 
                     elif name == 'sbert':
-                        algorithm_config.setdefault('model_name', 'sentence-transformers/all-MiniLM-L6-v2')
+                        algorithm_config.setdefault('model_name', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
                         algorithm_config.setdefault('sbert_mode', True)
                         algorithm_config.setdefault('pooling', 'sentence')
                         algorithm_config.setdefault('section_aware', True)
@@ -151,7 +158,8 @@ class AlgorithmManager:
 
     def process_resumes_parallel(self, resume_texts: List[str],
                                  job_description: str, algorithm_names: List[str],
-                                 position: str = None, job_id: str = None) -> Dict[str, Any]:
+                                 position: str = None, job_id: str = None,
+                                 cv_id: str = None, options: dict = None) -> Dict[str, Any]:
         """Process resumes using multiple algorithms in parallel"""
         self.initialize_algorithms(algorithm_names)
 
@@ -159,7 +167,7 @@ class AlgorithmManager:
         if not available_algorithms:
             raise Exception("No algorithms available for processing")
 
-        logger.info(f"Processing {len(resume_texts)} resumes with {len(available_algorithms)} algorithms (job_id={job_id})")
+        logger.info(f"Processing {len(resume_texts)} resumes with {len(available_algorithms)} algorithms (job_id={job_id}, cv_id={cv_id})")
 
         results: Dict[str, Any] = {
             'metadata': {
@@ -180,20 +188,26 @@ class AlgorithmManager:
                 import inspect
                 if hasattr(alg, 'process_batch'):
                     sig = inspect.signature(alg.process_batch)
+                    kwargs = {}
                     if 'job_id' in sig.parameters:
-                        future = executor.submit(alg.process_batch, resume_texts, job_description, position, job_id=job_id)
-                    else:
-                        future = executor.submit(alg.process_batch, resume_texts, job_description, position)
+                        kwargs['job_id'] = job_id
+                    if 'cv_id' in sig.parameters:
+                        kwargs['cv_id'] = cv_id
+                    if 'chunk_level' in sig.parameters:
+                        kwargs['chunk_level'] = options.get('chunk_level', True) if options else True
+                    future = executor.submit(alg.process_batch, resume_texts, job_description, position, **kwargs)
                 else:
                     sig = inspect.signature(alg.process_single)
+                    kwargs = {}
                     if 'job_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                        future = executor.submit(
-                            lambda a=alg: [a.process_single(rt, job_description, position, job_id=job_id) for rt in resume_texts]
-                        )
-                    else:
-                        future = executor.submit(
-                            lambda a=alg: [a.process_single(rt, job_description, position) for rt in resume_texts]
-                        )
+                        kwargs['job_id'] = job_id
+                    if 'cv_id' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        kwargs['cv_id'] = cv_id
+                    if 'chunk_level' in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        kwargs['chunk_level'] = options.get('chunk_level', True) if options else True
+                    future = executor.submit(
+                        lambda a=alg, kw=kwargs: [a.process_single(rt, job_description, position, **kw) for rt in resume_texts]
+                    )
                 future_to_algorithm[future] = alg_name
 
             for future in concurrent.futures.as_completed(future_to_algorithm):

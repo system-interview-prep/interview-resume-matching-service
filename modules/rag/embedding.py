@@ -66,29 +66,6 @@ class EmbeddingAdapter:
         raise NotImplementedError
 
 
-class MockEmbeddingAdapter(EmbeddingAdapter):
-    """Deterministic mock embedding for local/dev tests without external dependencies."""
-
-    def __init__(self, dim: int = 384):
-        self.dim = int(dim)
-
-    def _hash_to_vector(self, text: str) -> List[float]:
-        buf = [0.0] * self.dim
-        raw = text.encode("utf-8", errors="ignore")
-        if not raw:
-            return buf
-        for i, b in enumerate(raw):
-            idx = i % self.dim
-            buf[idx] += ((b % 31) - 15) / 100.0
-        norm_sq = sum(x * x for x in buf)
-        if norm_sq > 0:
-            norm = norm_sq ** 0.5
-            buf = [x / norm for x in buf]
-        return buf
-
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        return [self._hash_to_vector(t) for t in texts]
-
 
 class OpenAIEmbeddingAdapter(EmbeddingAdapter):
     """OpenAI embeddings adapter.
@@ -114,7 +91,7 @@ class BedrockEmbeddingAdapter(EmbeddingAdapter):
     """AWS Bedrock embeddings adapter.
     Env:
     - AWS_REGION
-    - EMBEDDING_MODEL (e.g., amazon.titan-embed-text-v2:0)
+    - EMBEDDING_MODEL (e.g., cohere.embed-multilingual-v3)
     """
 
     def __init__(self, model_id: str):
@@ -124,6 +101,23 @@ class BedrockEmbeddingAdapter(EmbeddingAdapter):
         self._client = boto3.client("bedrock-runtime", region_name=region)
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        
+        # Batch support for Cohere
+        if "cohere" in self._model_id.lower():
+            body = json.dumps({
+                "texts": texts,
+                "input_type": "search_document"
+            })
+            resp = self._client.invoke_model(modelId=self._model_id, body=body)
+            payload = json.loads(resp["body"].read())
+            embeddings = payload.get("embeddings")
+            if isinstance(embeddings, list):
+                return [[float(x) for x in emb] for emb in embeddings]
+            raise ValueError("Cohere response does not contain 'embeddings' list")
+
+        # Fallback loop for Titan or other models
         vectors: List[List[float]] = []
         for text in texts:
             body = json.dumps({"inputText": text})
@@ -140,17 +134,18 @@ class BedrockEmbeddingAdapter(EmbeddingAdapter):
 
 
 def build_embedding_adapter_from_env() -> EmbeddingAdapter:
-    provider = os.getenv("EMBEDDING_PROVIDER", "mock").strip().lower()
+    provider = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
     model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
-    dim = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 
     if provider == "openai":
         return OpenAIEmbeddingAdapter(model_name=model)
     if provider in {"bedrock", "aws_bedrock", "aws"}:
         return BedrockEmbeddingAdapter(model_id=model)
 
-    logger.warning("Using MockEmbeddingAdapter. Set EMBEDDING_PROVIDER=openai|bedrock for production.")
-    return MockEmbeddingAdapter(dim=dim)
+    raise ValueError(
+        f"Invalid or missing EMBEDDING_PROVIDER: '{provider}'. "
+        "Must configure EMBEDDING_PROVIDER=openai|bedrock in environment variables."
+    )
 
 
 @dataclass

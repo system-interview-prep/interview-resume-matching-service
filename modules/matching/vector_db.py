@@ -205,6 +205,135 @@ class VectorDB:
         finally:
             cur.close()
 
+    def init_cv_table(self):
+        """Create the cv_profiles_vector table and ensure all model/version columns exist."""
+        conn = self._get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS cv_profiles_vector (
+                    cv_id VARCHAR(255) PRIMARY KEY,
+                    cv_vector vector({self.vector_dimension}),
+                    bert_vector vector(768),
+                    distilbert_vector vector(768),
+                    checksum VARCHAR(64),
+                    version INT DEFAULT 1,
+                    cv_text TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+            logger.info("cv_profiles_vector table initialized successfully")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to initialize CV vector table: {e}")
+            raise
+        finally:
+            cur.close()
+
+    def get_cv_cache(self, cv_id: str) -> dict | None:
+        """Retrieve cache record for a CV including all vectors, checksum, version, and cv_text."""
+        conn = self._get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT cv_vector, bert_vector, distilbert_vector, checksum, version, cv_text 
+                FROM cv_profiles_vector 
+                WHERE cv_id = %s;
+            """, (cv_id,))
+            result = cur.fetchone()
+            if result:
+                return {
+                    'sbert': result[0].tolist() if result[0] is not None and hasattr(result[0], 'tolist') else result[0],
+                    'bert': result[1].tolist() if result[1] is not None and hasattr(result[1], 'tolist') else result[1],
+                    'distilbert': result[2].tolist() if result[2] is not None and hasattr(result[2], 'tolist') else result[2],
+                    'checksum': result[3],
+                    'version': result[4],
+                    'cv_text': result[5]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get cache for cv_id={cv_id}: {e}")
+            raise
+        finally:
+            cur.close()
+
+    def upsert_cv_cache(self, cv_id: str, checksum: str, model_name: str, vector: list, cv_text: str = None):
+        """Upsert vector for a specific model under a specific checksum for a CV."""
+        column_map = {
+            'sbert': 'cv_vector',
+            'bert': 'bert_vector',
+            'distilbert': 'distilbert_vector'
+        }
+        col = column_map.get(model_name)
+        if not col:
+            raise ValueError(f"Unsupported model name for CV database caching: {model_name}")
+
+        conn = self._get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT checksum, version FROM cv_profiles_vector WHERE cv_id = %s;", (cv_id,))
+            row = cur.fetchone()
+
+            if row:
+                stored_checksum, stored_version = row[0], row[1]
+                if stored_checksum != checksum:
+                    other_cols = [c for c in column_map.values() if c != col]
+                    set_clause = ", ".join([f"{c} = NULL" for c in other_cols])
+                    cur.execute(f"""
+                        UPDATE cv_profiles_vector
+                        SET {col} = %s, checksum = %s, version = %s, cv_text = %s, {set_clause}, updated_at = NOW()
+                        WHERE cv_id = %s;
+                    """, (vector, checksum, (stored_version or 1) + 1, cv_text, cv_id))
+                    logger.info(f"CV updated for {cv_id}. Version bumped to {(stored_version or 1) + 1}, cleared other stale vectors.")
+                else:
+                    if cv_text is not None:
+                        cur.execute(f"""
+                            UPDATE cv_profiles_vector
+                            SET {col} = %s, cv_text = %s, updated_at = NOW()
+                            WHERE cv_id = %s;
+                        """, (vector, cv_text, cv_id))
+                    else:
+                        cur.execute(f"""
+                            UPDATE cv_profiles_vector
+                            SET {col} = %s, updated_at = NOW()
+                            WHERE cv_id = %s;
+                        """, (vector, cv_id))
+            else:
+                cur.execute(f"""
+                    INSERT INTO cv_profiles_vector (cv_id, checksum, version, cv_text, {col})
+                    VALUES (%s, %s, 1, %s, %s);
+                """, (cv_id, checksum, cv_text, vector))
+                logger.info(f"Initialized new CV cache for {cv_id} at version 1.")
+
+            conn.commit()
+            logger.info(f"Upserted {model_name} vector cache for cv_id={cv_id}")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to upsert CV cache for cv_id={cv_id}: {e}")
+            raise
+        finally:
+            cur.close()
+
+    def delete_cv_vector(self, cv_id: str):
+        """Delete a CV vector embedding."""
+        conn = self._get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "DELETE FROM cv_profiles_vector WHERE cv_id = %s;",
+                (cv_id,)
+            )
+            conn.commit()
+            logger.info(f"Deleted vector for cv_id={cv_id}")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to delete CV vector for cv_id={cv_id}: {e}")
+            raise
+        finally:
+            cur.close()
+
     def close(self):
         """Close the database connection."""
         if self._conn and not self._conn.closed:

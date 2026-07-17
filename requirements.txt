@@ -3,10 +3,11 @@ setuptools>=65.0.0
 wheel>=0.38.0
 Cython>=0.29.0
 
-# Flask Framework
-Flask==3.0.3
-Flask-CORS==4.0.1
-Werkzeug==3.0.3
+# FastAPI Framework
+fastapi==0.110.0
+uvicorn==0.30.1
+celery==5.4.0
+pydantic==2.7.4
 
 # Pre-built wheels for blis and other Cython packages
 --find-links https://github.com/explosion/spacy-models/releases/download
@@ -39,5 +40,8 @@ psycopg2-binary==2.9.9
 pgvector==0.2.5
 
 # Utilities
-gunicorn==22.0.0
 python-dotenv==1.0.1
+
+# AI Providers
+boto3>=1.28.0
+openai>=1.0.0

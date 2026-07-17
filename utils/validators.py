@@ -1,6 +1,6 @@
 from typing import Dict, List, Any
 import re
-from flask import Request
+Request = Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ class RequestValidator:
         
         # Valid algorithms
         self.valid_algorithms = {
-            'bert', 'distilbert', 'sbert',
+            'bert', 'distilbert', 'sbert', 'cross_encoder',
             'cosine', 'jaccard', 'bm25', 'requirements', 'must_have', 'ner',
         }
         

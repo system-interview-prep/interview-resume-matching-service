@@ -5,7 +5,6 @@ Exposes main functions for embedding generation, vector database operations, and
 
 from modules.rag.embedding import (
     EmbeddingAdapter,
-    MockEmbeddingAdapter,
     OpenAIEmbeddingAdapter,
     BedrockEmbeddingAdapter,
     build_embedding_adapter_from_env,
@@ -25,7 +24,6 @@ from modules.rag.llm import LLMService
 
 __all__ = [
     "EmbeddingAdapter",
-    "MockEmbeddingAdapter",
     "OpenAIEmbeddingAdapter",
     "BedrockEmbeddingAdapter",
     "build_embedding_adapter_from_env",
